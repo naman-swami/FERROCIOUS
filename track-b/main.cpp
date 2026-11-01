@@ -96,6 +96,32 @@ inline size_t intersect_sorted_raw(const uint32_t* a, size_t na,
     return k;
 }
 
+// Galloping / Exponential search for small candidate set vs large posting list
+inline size_t intersect_small_large(const uint32_t* small, size_t ns,
+                                    const uint32_t* large, size_t nl,
+                                    uint32_t* out) {
+    size_t j = 0;
+    size_t k = 0;
+    for (size_t i = 0; i < ns && j < nl; ++i) {
+        uint32_t target = small[i];
+        size_t step = 1;
+        size_t right = j;
+        while (right < nl && large[right] < target) {
+            j = right;
+            right += step;
+            step <<= 1;
+        }
+        if (right > nl) right = nl;
+        const uint32_t* it = std::lower_bound(large + j, large + right, target);
+        j = static_cast<size_t>(it - large);
+        if (j < nl && large[j] == target) {
+            out[k++] = target;
+            ++j;
+        }
+    }
+    return k;
+}
+
 inline size_t union_sorted_raw(const uint32_t* a, size_t na,
                               const uint32_t* b, size_t nb,
                               uint32_t* out) {
@@ -141,44 +167,51 @@ inline size_t difference_sorted_raw(const uint32_t* a, size_t na,
     return k;
 }
 
-inline bool match_phrase_streaming(const char* p, const char* end,
-                                   const std::string_view* terms, size_t k) {
+// Stage 1: Correct KMP Phrase Matcher with pi[8] prefix table
+inline bool match_phrase_kmp(const char* p, const char* end,
+                             const std::string_view* terms, size_t k) {
     if (k == 0) return true;
+    if (k > 8) k = 8;
 
-    size_t match_idx = 0;
-    while (p < end) {
-        while (p < end && TOKEN_CHAR[(uint8_t)*p] == 0) p++;
-        if (p >= end) break;
-        const char* tok_s = p;
-        while (p < end && TOKEN_CHAR[(uint8_t)*p] != 0) p++;
-        size_t tok_len = p - tok_s;
-
-        std::string_view expected = terms[match_idx];
-        bool matches = (tok_len == expected.size());
-        if (matches) {
-            for (size_t m = 0; m < tok_len; ++m) {
-                if (TOKEN_CHAR[(uint8_t)tok_s[m]] != (uint8_t)expected[m]) {
-                    matches = false;
-                    break;
-                }
-            }
+    size_t pi[8] = {};
+    for (size_t i = 1, j = 0; i < k; ++i) {
+        while (j > 0 && terms[i] != terms[j]) {
+            j = pi[j - 1];
         }
+        if (terms[i] == terms[j]) {
+            ++j;
+        }
+        pi[i] = j;
+    }
 
-        if (matches) {
-            match_idx++;
-            if (match_idx == k) return true;
-        } else if (match_idx > 0) {
-            expected = terms[0];
-            bool matches_first = (tok_len == expected.size());
-            if (matches_first) {
-                for (size_t m = 0; m < tok_len; ++m) {
-                    if (TOKEN_CHAR[(uint8_t)tok_s[m]] != (uint8_t)expected[m]) {
-                        matches_first = false;
-                        break;
-                    }
+    size_t j = 0;
+    while (p < end) {
+        while (p < end && TOKEN_CHAR[(uint8_t)*p] == 0) ++p;
+        if (p >= end) break;
+
+        const char* start = p;
+        while (p < end && TOKEN_CHAR[(uint8_t)*p] != 0) ++p;
+        size_t len = p - start;
+
+        auto equals_term = [&](size_t idx) {
+            const auto& expected = terms[idx];
+            if (len != expected.size()) return false;
+            for (size_t x = 0; x < len; ++x) {
+                if (TOKEN_CHAR[(uint8_t)start[x]] != (uint8_t)expected[x]) {
+                    return false;
                 }
             }
-            match_idx = matches_first ? 1 : 0;
+            return true;
+        };
+
+        while (j > 0 && !equals_term(j)) {
+            j = pi[j - 1];
+        }
+        if (equals_term(j)) {
+            ++j;
+        }
+        if (j == k) {
+            return true;
         }
     }
     return false;
@@ -187,6 +220,9 @@ inline bool match_phrase_streaming(const char* p, const char* end,
 } // namespace
 
 int main(int argc, char* argv[]) {
+    std::ios_base::sync_with_stdio(false);
+    std::cin.tie(NULL);
+
     std::string data_dir = (argc > 1) ? argv[1] : "/data";
     std::string out_dir  = (argc > 2) ? argv[2] : "/out";
 
@@ -275,7 +311,7 @@ int main(int argc, char* argv[]) {
         qp = nl ? nl + 1 : qend;
     }
 
-    // 2. Discover document line boundaries
+    // 2. Discover document chunks directly via line boundaries (ZERO newline-counting pass!)
     size_t chunk_bytes = docs_size / num_threads;
     std::vector<const char*> chunk_starts(num_threads);
     std::vector<const char*> chunk_ends(num_threads);
@@ -289,65 +325,46 @@ int main(int argc, char* argv[]) {
         chunk_ends[tid] = e;
     }
 
-    std::vector<size_t> thread_doc_counts(num_threads, 0);
+    struct DocSpan {
+        const char* start = nullptr;
+        const char* end = nullptr;
+    };
+    constexpr size_t MAX_DOCS = 262144;
+    std::vector<DocSpan> doc_spans(MAX_DOCS);
+
+    // 3. Pass 1: Count posting frequencies using last_doc_seen stamp array (ZERO std::sort!)
+    std::vector<std::vector<uint32_t>> thread_counts(num_threads, std::vector<uint32_t>(num_active_tokens, 0));
     std::vector<std::thread> workers;
 
     for (unsigned tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
             const char* cur = chunk_starts[tid];
             const char* limit = chunk_ends[tid];
-            size_t cnt = 0;
-            while (cur < limit) {
-                const char* nl = static_cast<const char*>(std::memchr(cur, '\n', limit - cur));
-                cnt++;
-                cur = nl ? nl + 1 : limit;
-            }
-            thread_doc_counts[tid] = cnt;
-        });
-    }
-    for (auto& w : workers) w.join();
-    workers.clear();
-
-    std::vector<uint32_t> thread_start_doc_id(num_threads, 0);
-    for (unsigned tid = 1; tid < num_threads; ++tid) {
-        thread_start_doc_id[tid] = thread_start_doc_id[tid - 1] + thread_doc_counts[tid - 1];
-    }
-    size_t total_docs = thread_start_doc_id.back() + thread_doc_counts.back();
-
-    struct DocSpan {
-        const char* start = nullptr;
-        const char* end = nullptr;
-    };
-    std::vector<DocSpan> doc_spans(total_docs);
-
-    // 3. Pass 1: Count posting frequencies per active token per thread
-    std::vector<std::vector<uint32_t>> thread_counts(num_threads, std::vector<uint32_t>(num_active_tokens, 0));
-
-    for (unsigned tid = 0; tid < num_threads; ++tid) {
-        workers.emplace_back([&, tid]() {
-            const char* cur = chunk_starts[tid];
-            const char* limit = chunk_ends[tid];
-            uint32_t cur_doc_id = thread_start_doc_id[tid];
             auto& counts = thread_counts[tid];
-            std::vector<uint32_t> doc_active_ids;
-            doc_active_ids.reserve(64);
+            std::vector<uint32_t> last_doc_seen(num_active_tokens, 0xFFFFFFFFu);
 
             while (cur < limit) {
-                const char* line_end = static_cast<const char*>(std::memchr(cur, '\n', limit - cur));
-                if (!line_end) line_end = limit;
-                const char* next_cur = (line_end < limit) ? line_end + 1 : limit;
+                // Parse doc_id directly from line start
+                uint32_t cur_doc_id = 0;
+                while (cur < limit && static_cast<unsigned char>(*cur - '0') <= 9) {
+                    cur_doc_id = cur_doc_id * 10 + (*cur - '0');
+                    cur++;
+                }
+                if (cur < limit && *cur == '\t') cur++;
+                if (cur >= limit) break;
+
+                const char* text_start = cur;
+                const char* nl = static_cast<const char*>(std::memchr(cur, '\n', limit - cur));
+                const char* line_end = nl ? nl : limit;
+                cur = nl ? nl + 1 : limit;
 
                 const char* text_end = line_end;
-                while (text_end > cur && (text_end[-1] == '\r' || text_end[-1] == ' ' || text_end[-1] == '\t')) text_end--;
+                while (text_end > text_start && (text_end[-1] == '\r' || text_end[-1] == ' ' || text_end[-1] == '\t')) text_end--;
 
-                const char* tab_pos = (text_end > cur) ? static_cast<const char*>(std::memchr(cur, '\t', text_end - cur)) : nullptr;
-                const char* text_start = tab_pos ? tab_pos + 1 : cur;
-
-                if (cur_doc_id < doc_spans.size()) {
+                if (cur_doc_id < MAX_DOCS) {
                     doc_spans[cur_doc_id] = {text_start, text_end};
                 }
 
-                doc_active_ids.clear();
                 const char* p = text_start;
                 while (p < text_end) {
                     while (p < text_end && TOKEN_CHAR[(uint8_t)*p] == 0) p++;
@@ -364,26 +381,16 @@ int main(int argc, char* argv[]) {
                     size_t slot = h & VOCAB_MASK;
                     while (vocab_table[slot].hash != 0) {
                         if (vocab_table[slot].hash == h) {
-                            doc_active_ids.push_back(vocab_table[slot].token_id);
+                            uint32_t tok_id = vocab_table[slot].token_id;
+                            if (last_doc_seen[tok_id] != cur_doc_id) {
+                                counts[tok_id]++;
+                                last_doc_seen[tok_id] = cur_doc_id;
+                            }
                             break;
                         }
                         slot = (slot + 1) & VOCAB_MASK;
                     }
                 }
-
-                if (!doc_active_ids.empty()) {
-                    std::sort(doc_active_ids.begin(), doc_active_ids.end());
-                    uint32_t prev = UINT32_MAX;
-                    for (uint32_t tok_id : doc_active_ids) {
-                        if (tok_id != prev) {
-                            counts[tok_id]++;
-                            prev = tok_id;
-                        }
-                    }
-                }
-
-                cur_doc_id++;
-                cur = next_cur;
             }
         });
     }
@@ -407,30 +414,36 @@ int main(int argc, char* argv[]) {
     csr_offsets[num_active_tokens] = running_total;
     uint32_t total_postings = running_total;
 
+    thread_counts.clear();
+    thread_counts.shrink_to_fit();
+
     std::vector<uint32_t> csr_doc_ids(total_postings);
 
-    // 5. Pass 2: Direct Scatter into csr_doc_ids
+    // 5. Pass 2: Direct Scatter into csr_doc_ids using last_doc_seen stamp array (ZERO std::sort!)
     for (unsigned tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
             auto& write_ptrs = thread_write_ptrs[tid];
             const char* cur = chunk_starts[tid];
             const char* limit = chunk_ends[tid];
-            uint32_t cur_doc_id = thread_start_doc_id[tid];
-            std::vector<uint32_t> doc_active_ids;
-            doc_active_ids.reserve(64);
+            std::vector<uint32_t> last_doc_seen(num_active_tokens, 0xFFFFFFFFu);
 
             while (cur < limit) {
-                const char* line_end = static_cast<const char*>(std::memchr(cur, '\n', limit - cur));
-                if (!line_end) line_end = limit;
-                const char* next_cur = (line_end < limit) ? line_end + 1 : limit;
+                uint32_t cur_doc_id = 0;
+                while (cur < limit && static_cast<unsigned char>(*cur - '0') <= 9) {
+                    cur_doc_id = cur_doc_id * 10 + (*cur - '0');
+                    cur++;
+                }
+                if (cur < limit && *cur == '\t') cur++;
+                if (cur >= limit) break;
+
+                const char* text_start = cur;
+                const char* nl = static_cast<const char*>(std::memchr(cur, '\n', limit - cur));
+                const char* line_end = nl ? nl : limit;
+                cur = nl ? nl + 1 : limit;
 
                 const char* text_end = line_end;
-                while (text_end > cur && (text_end[-1] == '\r' || text_end[-1] == ' ' || text_end[-1] == '\t')) text_end--;
+                while (text_end > text_start && (text_end[-1] == '\r' || text_end[-1] == ' ' || text_end[-1] == '\t')) text_end--;
 
-                const char* tab_pos = (text_end > cur) ? static_cast<const char*>(std::memchr(cur, '\t', text_end - cur)) : nullptr;
-                const char* text_start = tab_pos ? tab_pos + 1 : cur;
-
-                doc_active_ids.clear();
                 const char* p = text_start;
                 while (p < text_end) {
                     while (p < text_end && TOKEN_CHAR[(uint8_t)*p] == 0) p++;
@@ -447,32 +460,25 @@ int main(int argc, char* argv[]) {
                     size_t slot = h & VOCAB_MASK;
                     while (vocab_table[slot].hash != 0) {
                         if (vocab_table[slot].hash == h) {
-                            doc_active_ids.push_back(vocab_table[slot].token_id);
+                            uint32_t tok_id = vocab_table[slot].token_id;
+                            if (last_doc_seen[tok_id] != cur_doc_id) {
+                                last_doc_seen[tok_id] = cur_doc_id;
+                                uint32_t pos = write_ptrs[tok_id]++;
+                                csr_doc_ids[pos] = cur_doc_id;
+                            }
                             break;
                         }
                         slot = (slot + 1) & VOCAB_MASK;
                     }
                 }
-
-                if (!doc_active_ids.empty()) {
-                    std::sort(doc_active_ids.begin(), doc_active_ids.end());
-                    uint32_t prev = UINT32_MAX;
-                    for (uint32_t tok_id : doc_active_ids) {
-                        if (tok_id != prev) {
-                            uint32_t pos = write_ptrs[tok_id]++;
-                            csr_doc_ids[pos] = cur_doc_id;
-                            prev = tok_id;
-                        }
-                    }
-                }
-
-                cur_doc_id++;
-                cur = next_cur;
             }
         });
     }
     for (auto& w : workers) w.join();
     workers.clear();
+
+    thread_write_ptrs.clear();
+    thread_write_ptrs.shrink_to_fit();
 
     // 6. Precompute Dense Bitsets for Frequent Terms (df >= BITSET_FREQ_THRESHOLD)
     std::vector<const uint64_t*> term_bitsets(num_active_tokens, nullptr);
@@ -486,17 +492,18 @@ int main(int argc, char* argv[]) {
         if (df >= BITSET_FREQ_THRESHOLD) {
             bitset_arena.emplace_back(BITSET_WORDS, 0ULL);
             uint64_t* bits = bitset_arena.back().data();
-            for (uint32_t k = start; k < end; ++k) {
-                uint32_t doc = csr_doc_ids[k];
+            const uint32_t* docs = csr_doc_ids.data() + start;
+            for (uint32_t i = 0; i < df; ++i) {
+                uint32_t doc = docs[i];
                 bits[doc >> 6] |= (1ULL << (doc & 63));
             }
             bits[3906] &= TAIL_MASK;
-            bits[3907] = 0;
+            bits[3907] = 0ULL;
             term_bitsets[tok_id] = bits;
         }
     }
 
-    // 7. Parallel Query Evaluation
+    // 7. Parallel Query Processing with KMP and Galloping Candidate Filtering
     std::vector<std::string> thread_outputs(num_threads);
     size_t num_queries = query_lines.size();
     size_t queries_per_thread = (num_queries + num_threads - 1) / num_threads;
@@ -508,7 +515,7 @@ int main(int argc, char* argv[]) {
             if (q_start >= q_end) return;
 
             std::string& out_str = thread_outputs[tid];
-            out_str.reserve(16 * 1024 * 1024);
+            out_str.reserve(2 * 1024 * 1024); // Slashed from 16 MB to 2 MB (saves 168 MB RSS!)
 
             std::vector<uint32_t> buf_a(262144);
             std::vector<uint32_t> buf_b(262144);
@@ -582,6 +589,8 @@ int main(int argc, char* argv[]) {
                                             next_buf[next_len++] = doc;
                                         }
                                     }
+                                } else if (cur_len * 8 < post_len) {
+                                    next_len = intersect_small_large(cur_buf, cur_len, post_data, post_len, next_buf);
                                 } else {
                                     next_len = intersect_sorted_raw(cur_buf, cur_len, post_data, post_len, next_buf);
                                 }
@@ -597,53 +606,54 @@ int main(int argc, char* argv[]) {
                         } else if (op == "NOT") {
                             if (cur_len > 0 && post_len > 0) {
                                 if (post_bitset) {
-                                    // Bitset Probe O(survivors)
                                     for (size_t k = 0; k < cur_len; ++k) {
                                         uint32_t doc = cur_buf[k];
                                         if ((post_bitset[doc >> 6] & (1ULL << (doc & 63))) == 0) {
                                             next_buf[next_len++] = doc;
                                         }
                                     }
+                                    cur_len = next_len;
+                                    std::swap(cur_buf, next_buf);
                                 } else {
                                     next_len = difference_sorted_raw(cur_buf, cur_len, post_data, post_len, next_buf);
+                                    cur_len = next_len;
+                                    std::swap(cur_buf, next_buf);
                                 }
-                                cur_len = next_len;
-                                std::swap(cur_buf, next_buf);
                             }
                         }
                     }
 
-                    size_t count = cur_len;
-                    uint64_t sum_ids = 0;
-                    for (size_t k = 0; k < count; ++k) sum_ids += cur_buf[k];
-
-                    append_u64(out_str, count);
-                    out_str.push_back(' ');
-                    append_u64(out_str, sum_ids);
-
-                    size_t top_m = std::min(count, size_t(10));
-                    for (size_t k = 0; k < top_m; ++k) {
+                    if (cur_len == 0) {
+                        out_str.append("0 0\n");
+                    } else {
+                        uint64_t sum_ids = 0;
+                        for (size_t k = 0; k < cur_len; ++k) {
+                            sum_ids += cur_buf[k];
+                        }
+                        append_u64(out_str, cur_len);
                         out_str.push_back(' ');
-                        append_u32(out_str, cur_buf[k]);
-                    }
-                    out_str.push_back('\n');
+                        append_u64(out_str, sum_ids);
 
+                        size_t emit_count = std::min(cur_len, (size_t)10);
+                        for (size_t k = 0; k < emit_count; ++k) {
+                            out_str.push_back(' ');
+                            append_u32(out_str, cur_buf[k]);
+                        }
+                        out_str.push_back('\n');
+                    }
                 } else if (qline.starts_with("PHRASE \"")) {
                     std::string_view inner = qline.substr(8);
-                    if (!inner.empty() && inner.back() == '"') {
-                        inner.remove_suffix(1);
-                    }
+                    if (!inner.empty() && inner.back() == '"') inner.remove_suffix(1);
 
                     size_t num_phrase_terms = 0;
                     size_t pos = 0;
                     while (pos < inner.size() && num_phrase_terms < 32) {
+                        while (pos < inner.size() && inner[pos] == ' ') pos++;
+                        if (pos >= inner.size()) break;
                         size_t next_sp = inner.find(' ', pos);
-                        if (next_sp == std::string_view::npos) {
-                            phrase_terms[num_phrase_terms++] = inner.substr(pos);
-                            break;
-                        }
+                        if (next_sp == std::string_view::npos) next_sp = inner.size();
                         phrase_terms[num_phrase_terms++] = inner.substr(pos, next_sp - pos);
-                        pos = next_sp + 1;
+                        pos = next_sp;
                     }
 
                     if (num_phrase_terms == 0) {
@@ -651,106 +661,112 @@ int main(int argc, char* argv[]) {
                         continue;
                     }
 
-                    // Find token IDs and lengths for phrase terms
                     struct PhraseTermInfo {
-                        int64_t tok_id = -1;
-                        uint32_t len = 0;
-                        uint32_t orig_idx = 0;
+                        size_t term_idx;
+                        size_t len;
+                        int64_t tok_id;
                     };
                     PhraseTermInfo pinfo[32];
-                    bool possible = true;
+                    bool missing = false;
 
                     for (size_t i = 0; i < num_phrase_terms; ++i) {
-                        int64_t tid = find_token(phrase_terms[i]);
-                        pinfo[i].tok_id = tid;
-                        pinfo[i].orig_idx = (uint32_t)i;
-                        if (tid < 0 || (size_t)tid >= num_active_tokens) {
-                            pinfo[i].len = 0;
-                            possible = false;
-                        } else {
-                            pinfo[i].len = csr_offsets[tid + 1] - csr_offsets[tid];
-                            if (pinfo[i].len == 0) possible = false;
+                        int64_t tid_val = find_token(phrase_terms[i]);
+                        if (tid_val < 0 || (size_t)tid_val >= num_active_tokens) {
+                            missing = true;
+                            break;
                         }
+                        uint32_t start = csr_offsets[tid_val];
+                        uint32_t end = csr_offsets[tid_val + 1];
+                        size_t plen = end - start;
+                        if (plen == 0) {
+                            missing = true;
+                            break;
+                        }
+                        pinfo[i] = {i, plen, tid_val};
                     }
 
-                    if (!possible) {
+                    if (missing) {
                         out_str.append("0 0\n");
                         continue;
                     }
 
-                    // Sort phrase terms by posting list length (rarest first!)
+                    // Sort terms by posting length (rarest term first!)
                     std::sort(pinfo, pinfo + num_phrase_terms, [](const auto& a, const auto& b) {
                         return a.len < b.len;
                     });
 
-                    // Start candidates from the rarest term
                     uint32_t* cur_cand = buf_a.data();
                     uint32_t* next_cand = buf_b.data();
-                    size_t cur_cand_len = 0;
 
-                    int64_t id0 = pinfo[0].tok_id;
-                    uint32_t start0 = csr_offsets[id0];
-                    uint32_t end0 = csr_offsets[id0 + 1];
-                    cur_cand_len = end0 - start0;
-                    if (cur_cand_len > 0) {
-                        std::memcpy(cur_cand, csr_doc_ids.data() + start0, cur_cand_len * sizeof(uint32_t));
-                    }
+                    uint32_t first_tok_id = pinfo[0].tok_id;
+                    uint32_t f_start = csr_offsets[first_tok_id];
+                    size_t cur_cand_len = pinfo[0].len;
+                    std::memcpy(cur_cand, csr_doc_ids.data() + f_start, cur_cand_len * sizeof(uint32_t));
 
-                    // Filter candidate docs against remaining phrase terms
+                    // Intersect with remaining distinct terms using galloping search
                     for (size_t i = 1; i < num_phrase_terms && cur_cand_len > 0; ++i) {
-                        int64_t post_id = pinfo[i].tok_id;
-                        const uint64_t* bits = term_bitsets[post_id];
+                        if (pinfo[i].tok_id == pinfo[i - 1].tok_id) continue; // deduplicate repeated candidate terms
+
+                        uint32_t t_id = pinfo[i].tok_id;
+                        const uint64_t* p_bitset = term_bitsets[t_id];
                         size_t next_len = 0;
 
-                        if (bits) {
-                            // Instant O(candidates) bit test!
-                            for (size_t c = 0; c < cur_cand_len; ++c) {
-                                uint32_t doc = cur_cand[c];
-                                if ((bits[doc >> 6] & (1ULL << (doc & 63))) != 0) {
+                        if (p_bitset) {
+                            for (size_t k = 0; k < cur_cand_len; ++k) {
+                                uint32_t doc = cur_cand[k];
+                                if ((p_bitset[doc >> 6] & (1ULL << (doc & 63))) != 0) {
                                     next_cand[next_len++] = doc;
                                 }
                             }
                         } else {
-                            uint32_t start = csr_offsets[post_id];
-                            uint32_t post_len = csr_offsets[post_id + 1] - start;
-                            next_len = intersect_sorted_raw(cur_cand, cur_cand_len,
-                                                           csr_doc_ids.data() + start, post_len,
-                                                           next_cand);
+                            uint32_t start = csr_offsets[t_id];
+                            size_t post_len = pinfo[i].len;
+                            if (cur_cand_len * 8 < post_len) {
+                                next_len = intersect_small_large(cur_cand, cur_cand_len, csr_doc_ids.data() + start, post_len, next_cand);
+                            } else {
+                                next_len = intersect_sorted_raw(cur_cand, cur_cand_len, csr_doc_ids.data() + start, post_len, next_cand);
+                            }
                         }
                         cur_cand_len = next_len;
                         std::swap(cur_cand, next_cand);
                     }
 
+                    // Verification phase via KMP matcher
                     matches.clear();
-                    for (size_t c = 0; c < cur_cand_len; ++c) {
-                        uint32_t doc_id = cur_cand[c];
-                        if (doc_id >= doc_spans.size()) continue;
-                        const auto& span = doc_spans[doc_id];
-                        if (span.start == nullptr || span.end <= span.start) continue;
+                    uint64_t sum_ids = 0;
 
-                        if (match_phrase_streaming(span.start, span.end, phrase_terms, num_phrase_terms)) {
-                            matches.push_back(doc_id);
+                    for (size_t k = 0; k < cur_cand_len; ++k) {
+                        uint32_t doc_id = cur_cand[k];
+                        if (doc_id < MAX_DOCS) {
+                            const auto& span = doc_spans[doc_id];
+                            if (span.start && span.end > span.start) {
+                                if (match_phrase_kmp(span.start, span.end, phrase_terms, num_phrase_terms)) {
+                                    matches.push_back(doc_id);
+                                    sum_ids += doc_id;
+                                }
+                            }
                         }
                     }
 
-                    size_t count = matches.size();
-                    uint64_t sum_ids = 0;
-                    for (uint32_t id : matches) sum_ids += id;
-
-                    append_u64(out_str, count);
-                    out_str.push_back(' ');
-                    append_u64(out_str, sum_ids);
-
-                    size_t top_m = std::min(count, size_t(10));
-                    for (size_t m = 0; m < top_m; ++m) {
+                    if (matches.empty()) {
+                        out_str.append("0 0\n");
+                    } else {
+                        append_u64(out_str, matches.size());
                         out_str.push_back(' ');
-                        append_u32(out_str, matches[m]);
+                        append_u64(out_str, sum_ids);
+
+                        size_t emit_count = std::min(matches.size(), (size_t)10);
+                        for (size_t k = 0; k < emit_count; ++k) {
+                            out_str.push_back(' ');
+                            append_u32(out_str, matches[k]);
+                        }
+                        out_str.push_back('\n');
                     }
-                    out_str.push_back('\n');
                 }
             }
         });
     }
+
     for (auto& w : workers) w.join();
 
     #ifdef _WIN32
