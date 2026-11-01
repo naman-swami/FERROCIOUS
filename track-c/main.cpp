@@ -11,6 +11,7 @@
 #include <atomic>
 #include <mutex>
 #include <bit>
+#include <memory>
 #include "ferocious_common.hpp"
 
 namespace {
@@ -84,7 +85,7 @@ struct PoolSlot {
 };
 
 static PoolSlot pool_table[POOL_CAP];
-static char pool_arena[8 * 1024 * 1024]; // 8 MB fixed arena
+static char pool_arena[2 * 1024 * 1024]; // 2 MB fixed arena
 static std::atomic<uint32_t> pool_arena_size{0};
 static std::atomic<uint32_t> pool_next_id{0};
 
@@ -229,6 +230,10 @@ int main(int argc, char* argv[]) {
 
     uint16_t num_countries = (uint16_t)country_names.size();
 
+    // Allocate single shared global atomic bitset (Lock-free L3 resident)
+    size_t total_words = (size_t)num_countries * BITSET_WORDS;
+    auto global_seen = std::make_unique<std::atomic<uint64_t>[]>(total_words);
+
     // 2. Open records.csv
     ferocious::MappedFile mf(records_path.c_str());
     if (!mf.ok) return 1;
@@ -278,7 +283,6 @@ int main(int argc, char* argv[]) {
     }
 
     std::vector<std::vector<ThreadStats>> thread_stats(num_threads, std::vector<ThreadStats>(num_countries));
-    std::vector<std::vector<uint64_t>> thread_seen(num_threads, std::vector<uint64_t>(num_countries * BITSET_WORDS, 0));
 
     std::vector<std::thread> workers;
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
@@ -286,7 +290,6 @@ int main(int argc, char* argv[]) {
             const char* p = data + chunk_starts[tid];
             const char* end = data + chunk_ends[tid];
             auto& stats = thread_stats[tid];
-            uint64_t* seen = thread_seen[tid].data();
 
             char unescape_buf[512];
 
@@ -352,30 +355,27 @@ int main(int argc, char* argv[]) {
                         }
                     }
                 } else {
-                    while (p < end && *p != ',') {
-                        note_len++;
-                        p++;
-                    }
+                    const char* ntstart = p;
+                    while (p < end && *p != ',') p++;
+                    note_len = (uint64_t)(p - ntstart);
                 }
                 if (p < end && *p == ',') p++;
 
-                uint32_t reg_id = 0;
+                uint32_t region_id = 0;
                 while (p < end && *p >= '0' && *p <= '9') {
-                    reg_id = reg_id * 10 + (*p - '0');
+                    region_id = region_id * 10 + (*p - '0');
                     p++;
                 }
                 if (p < end && *p == ',') p++;
 
                 const char* amt_start = p;
                 while (p < end && *p != '\r' && *p != '\n') p++;
-                const char* amt_end = p;
-
-                int64_t cents = parse_cents_strict(amt_start, amt_end);
+                int64_t cents = parse_cents_strict(amt_start, p);
 
                 if (p < end && *p == '\r') p++;
                 if (p < end && *p == '\n') p++;
 
-                uint16_t cid = (reg_id < 1000000) ? region_to_country[reg_id] : unmatched_cid;
+                uint16_t cid = (region_id < 1000000) ? region_to_country[region_id] : 0xFFFF;
                 if (cid == 0xFFFF) cid = unmatched_cid;
 
                 auto& cs = stats[cid];
@@ -388,26 +388,27 @@ int main(int argc, char* argv[]) {
                 cs.note_bytes += note_len;
 
                 uint32_t nid = get_or_register_name(name_ptr, name_len);
-                seen[cid * BITSET_WORDS + (nid >> 6)] |= (1ULL << (nid & 63));
+                size_t w_idx = (size_t)cid * BITSET_WORDS + (nid >> 6);
+                uint64_t bit = 1ULL << (nid & 63);
+                uint64_t old_val = global_seen[w_idx].load(std::memory_order_relaxed);
+                if ((old_val & bit) == 0) {
+                    global_seen[w_idx].fetch_or(bit, std::memory_order_relaxed);
+                }
             }
         });
     }
 
     for (auto& w : workers) w.join();
 
-    // 3. Merge stats and bitsets across threads
+    // 3. Merge stats and popcount global bitsets
     std::vector<CountryStats> final_stats(num_countries);
     for (uint16_t cid = 0; cid < num_countries; ++cid) {
         auto& fs = final_stats[cid];
         uint32_t distinct_cnt = 0;
-        size_t base_idx = cid * BITSET_WORDS;
+        size_t base_idx = (size_t)cid * BITSET_WORDS;
 
         for (size_t k = 0; k < BITSET_WORDS; ++k) {
-            uint64_t word = 0;
-            for (unsigned int tid = 0; tid < num_threads; ++tid) {
-                word |= thread_seen[tid][base_idx + k];
-            }
-            distinct_cnt += std::popcount(word);
+            distinct_cnt += (uint32_t)std::popcount(global_seen[base_idx + k].load(std::memory_order_relaxed));
         }
         fs.names_distinct = distinct_cnt;
 
