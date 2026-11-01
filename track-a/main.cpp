@@ -211,12 +211,11 @@ int main(int argc, char* argv[]) {
     std::vector<LocalDict> thread_dicts(num_threads);
     std::vector<std::vector<ThreadChunk>> thread_chunks(num_threads);
 
-    // 72 hours * 2048 max local endpoints = 147,456 per thread (589 KB)
     constexpr size_t LOCAL_MAX_CELLS = 72 * 2048;
     std::vector<std::vector<uint32_t>> thread_local_counts(num_threads, std::vector<uint32_t>(LOCAL_MAX_CELLS, 0));
     std::vector<std::vector<uint32_t>> thread_local_errors(num_threads, std::vector<uint32_t>(LOCAL_MAX_CELLS, 0));
 
-    // PASS 1: Work-stealing parse, count frequencies, record thread chunks (ZERO raw item allocations)
+    // PASS 1: Work-stealing parse, count frequencies, record thread chunks
     std::vector<std::thread> workers;
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
@@ -272,7 +271,7 @@ int main(int argc, char* argv[]) {
                     if (is_err) errors[cell]++;
 
                     // Advance past latency to next line
-                    const char* p_lat = sp + 5; // sp + 1 (status 3 chars) + 1 (space) = sp + 5
+                    const char* p_lat = sp + 5;
                     while (p_lat < limit && *p_lat != '\n') p_lat++;
                     cur = p_lat + 1;
                 }
@@ -362,17 +361,15 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Aggregate cell counts and errors
+    // Direct Accumulation of cell totals and errors (ZERO intermediate matrix allocations)
     size_t total_cells = 72 * (size_t)num_global_eps;
-    std::vector<std::vector<uint32_t>> thread_cell_counts(num_threads, std::vector<uint32_t>(total_cells, 0));
-    std::vector<std::vector<uint32_t>> thread_cell_errors(num_threads, std::vector<uint32_t>(total_cells, 0));
+    std::vector<uint32_t> cell_totals(total_cells, 0);
+    std::vector<uint32_t> cell_errors(total_cells, 0);
 
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         const auto& remap = thread_remap[tid];
         const auto& counts = thread_local_counts[tid];
         const auto& errors = thread_local_errors[tid];
-        auto& cell_counts = thread_cell_counts[tid];
-        auto& cell_errors = thread_cell_errors[tid];
 
         size_t num_local = remap.size();
         for (uint32_t h = 0; h < 72; ++h) {
@@ -382,54 +379,43 @@ int main(int argc, char* argv[]) {
                 uint32_t cnt = counts[local_base + id];
                 if (cnt > 0) {
                     uint16_t rank = remap[id];
-                    cell_counts[global_base + rank] += cnt;
-                    cell_errors[global_base + rank] += errors[local_base + id];
+                    size_t c = global_base + rank;
+                    cell_totals[c] += cnt;
+                    cell_errors[c] += errors[local_base + id];
                 }
             }
         }
     }
 
-    // Free thread_local_counts to reclaim memory
+    // Immediately free thread_local buffers BEFORE allocating flat latencies array!
     thread_local_counts.clear();
     thread_local_counts.shrink_to_fit();
     thread_local_errors.clear();
     thread_local_errors.shrink_to_fit();
+    thread_remap.clear();
+    thread_remap.shrink_to_fit();
 
     // Compute Prefix sums
-    std::vector<uint32_t> cell_totals(total_cells, 0);
-    std::vector<uint32_t> cell_errors(total_cells, 0);
     std::vector<uint32_t> cell_offsets(total_cells + 1, 0);
-    std::vector<std::vector<uint32_t>> thread_write_offsets(num_threads, std::vector<uint32_t>(total_cells, 0));
+    std::vector<std::atomic<uint32_t>> cell_heads(total_cells);
 
     uint32_t running_total = 0;
     for (size_t c = 0; c < total_cells; ++c) {
         cell_offsets[c] = running_total;
-        uint32_t c_base = running_total;
-        uint32_t c_total = 0;
-        uint32_t c_err = 0;
-        for (unsigned int tid = 0; tid < num_threads; ++tid) {
-            thread_write_offsets[tid][c] = c_base;
-            uint32_t t_cnt = thread_cell_counts[tid][c];
-            c_base += t_cnt;
-            c_total += t_cnt;
-            c_err += thread_cell_errors[tid][c];
-        }
-        cell_totals[c] = c_total;
-        cell_errors[c] = c_err;
-        running_total = c_base;
+        cell_heads[c].store(running_total, std::memory_order_relaxed);
+        running_total += cell_totals[c];
     }
     cell_offsets[total_cells] = running_total;
     uint32_t total_records = running_total;
 
-    // Single 12.4 MB flat contiguous array
+    // Single 12.4 MB flat contiguous array locked in L3 cache
     std::vector<uint32_t> all_latencies(total_records);
 
-    // PASS 2: Replay recorded chunks and write latencies directly into flat array
+    // PASS 2: Replay recorded chunks with lock-free atomic cell_head fetch_add
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
             const auto& dict = thread_dicts[tid];
             const auto& my_chunks = thread_chunks[tid];
-            auto& write_ptrs = thread_write_offsets[tid];
 
             for (const auto& chk : my_chunks) {
                 const char* cur = data + chk.start;
@@ -453,7 +439,7 @@ int main(int argc, char* argv[]) {
 
                     uint16_t rank = dict.get_rank_fast(ep_start, ep_len);
 
-                    // Latency: sp + 5 points to start of latency digits
+                    // Latency
                     const char* p_lat = sp + 5;
                     uint32_t latency = 0;
                     while (p_lat < limit && *p_lat != '\n') {
@@ -463,7 +449,7 @@ int main(int argc, char* argv[]) {
                     cur = p_lat + 1;
 
                     size_t cell_idx = (size_t)hour_idx * num_global_eps + rank;
-                    uint32_t pos = write_ptrs[cell_idx]++;
+                    uint32_t pos = cell_heads[cell_idx].fetch_add(1, std::memory_order_relaxed);
                     all_latencies[pos] = latency;
                 }
             }
@@ -473,11 +459,9 @@ int main(int argc, char* argv[]) {
     for (auto& w : workers) w.join();
     workers.clear();
 
-    // Free write offset structures
-    thread_write_offsets.clear();
-    thread_write_offsets.shrink_to_fit();
     thread_chunks.clear();
     thread_chunks.shrink_to_fit();
+    std::vector<std::atomic<uint32_t>>().swap(cell_heads);
 
     // PASS 3: Parallel sorting & output formatting per hour chunk
     std::vector<std::string> thread_output_strings(num_threads);
