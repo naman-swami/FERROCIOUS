@@ -1,6 +1,3 @@
-// FERROCIOUS Track D — Ultra-Low-Memory CSR + Hole-Shifting 4-ary MinHeap Bidirectional Dijkstra
-// Zero External Dependencies (D = 1.00). C++20.
-
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -8,6 +5,7 @@
 #include <algorithm>
 #include <thread>
 #include <atomic>
+#include <cstring>
 #include "ferocious_common.hpp"
 
 namespace {
@@ -19,7 +17,6 @@ struct HeapItem {
     uint32_t u;
 };
 
-// Ultra-Fast 4-ary Min-Heap with Hole Shifting (Zero intermediate swaps)
 struct MinHeap4 {
     std::vector<HeapItem> data;
 
@@ -77,9 +74,14 @@ struct MinHeap4 {
     }
 };
 
-// Compact 8-byte HalfEdge for L1/L2 cache locality
 struct HalfEdge {
     uint32_t to;
+    uint32_t w;
+};
+
+struct EdgeTuple {
+    uint32_t u;
+    uint32_t v;
     uint32_t w;
 };
 
@@ -106,7 +108,7 @@ int main(int argc, char* argv[]) {
     if (num_threads == 0) num_threads = 6;
     if (num_threads > 12) num_threads = 12;
 
-    // 1. Scope block for graph.txt: unmaps 92 MB immediately upon CSR construction
+    // 1. Ingest graph.txt with 1-Pass Thread-Local Buffering
     {
         ferocious::MappedFile gmf(graph_path.c_str());
         if (!gmf.ok) return 1;
@@ -144,10 +146,13 @@ int main(int argc, char* argv[]) {
             rev_degree[i].store(0, std::memory_order_relaxed);
         }
 
-        // Pass 1: Parse degrees directly into atomic counters
+        std::vector<std::vector<EdgeTuple>> thread_edges(num_threads);
+
+        // Pass 1: Parse ASCII edges ONCE, record degrees and buffer in thread_edges
         std::vector<std::thread> workers;
         for (unsigned int tid = 0; tid < num_threads; ++tid) {
             workers.emplace_back([&, tid]() {
+                thread_edges[tid].reserve((m / num_threads) + 65536);
                 const char* p = chunk_starts[tid];
                 const char* limit = chunk_ends[tid];
                 while (p < limit) {
@@ -158,9 +163,13 @@ int main(int argc, char* argv[]) {
                     while (p < limit && (*p == ' ' || *p == '\t')) p++;
                     uint32_t v = 0;
                     while (p < limit && *p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+                    while (p < limit && (*p == ' ' || *p == '\t')) p++;
+                    uint32_t w = 0;
+                    while (p < limit && *p >= '0' && *p <= '9') w = w * 10 + (*p++ - '0');
                     while (p < limit && *p != '\n') p++;
                     if (p < limit && *p == '\n') p++;
 
+                    thread_edges[tid].push_back({u, v, w});
                     fwd_degree[u + 1].fetch_add(1, std::memory_order_relaxed);
                     rev_degree[v + 1].fetch_add(1, std::memory_order_relaxed);
                 }
@@ -187,35 +196,21 @@ int main(int argc, char* argv[]) {
         fwd_edges.resize(m);
         rev_edges.resize(m);
 
-        // Pass 3: Parallel Direct Scatter into compact HalfEdge arrays
+        // Pass 3: Parallel Binary Scatter from memory (NO ASCII parsing, NO disk IO)
         for (unsigned int tid = 0; tid < num_threads; ++tid) {
             workers.emplace_back([&, tid]() {
-                const char* p = chunk_starts[tid];
-                const char* limit = chunk_ends[tid];
-                while (p < limit) {
-                    while (p < limit && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
-                    if (p >= limit) break;
-                    uint32_t u = 0;
-                    while (p < limit && *p >= '0' && *p <= '9') u = u * 10 + (*p++ - '0');
-                    while (p < limit && (*p == ' ' || *p == '\t')) p++;
-                    uint32_t v = 0;
-                    while (p < limit && *p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
-                    while (p < limit && (*p == ' ' || *p == '\t')) p++;
-                    uint32_t w = 0;
-                    while (p < limit && *p >= '0' && *p <= '9') w = w * 10 + (*p++ - '0');
-                    while (p < limit && *p != '\n') p++;
-                    if (p < limit && *p == '\n') p++;
+                for (const auto& edge : thread_edges[tid]) {
+                    uint32_t fp = cur_fwd[edge.u].fetch_add(1, std::memory_order_relaxed);
+                    fwd_edges[fp] = {edge.v, edge.w};
 
-                    uint32_t fp = cur_fwd[u].fetch_add(1, std::memory_order_relaxed);
-                    fwd_edges[fp] = {v, (uint32_t)w};
-
-                    uint32_t rp = cur_rev[v].fetch_add(1, std::memory_order_relaxed);
-                    rev_edges[rp] = {u, (uint32_t)w};
+                    uint32_t rp = cur_rev[edge.v].fetch_add(1, std::memory_order_relaxed);
+                    rev_edges[rp] = {edge.u, edge.w};
                 }
+                std::vector<EdgeTuple>().swap(thread_edges[tid]);
             });
         }
         for (auto& w : workers) w.join();
-    } // gmf destructor is called here! 92 MB file is completely unmapped!
+    } // gmf completely unmapped!
 
     // 2. Parse queries
     std::vector<std::pair<uint32_t, uint32_t>> queries;
@@ -241,13 +236,13 @@ int main(int argc, char* argv[]) {
 
             queries.push_back({s, t});
         }
-    } // qmf unmapped here!
+    } // qmf unmapped!
 
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
     std::atomic<size_t> query_idx{0};
 
-    // 3. Parallel Bidirectional Dijkstra (6 dedicated P-core threads for maximum CPU throughput & low memory)
+    // 3. Parallel Bidirectional Dijkstra (6 dedicated P-core threads for maximum cache hit rate)
     unsigned int query_threads = std::min(num_threads, 6u);
     std::vector<std::thread> workers;
     for (unsigned int tid = 0; tid < query_threads; ++tid) {
@@ -308,11 +303,13 @@ int main(int argc, char* argv[]) {
                             uint32_t v = fwd_edges[e].to;
                             uint64_t nd = d + fwd_edges[e].w;
                             if (nd < f_dist[v]) {
-                                if (f_dist[v] == INF64) f_visited.push_back(v);
-                                f_dist[v] = nd;
-                                f_heap.push(nd, v);
                                 if (r_dist[v] != INF64 && nd + r_dist[v] < mu) {
                                     mu = nd + r_dist[v];
+                                }
+                                if (nd < mu) {
+                                    if (f_dist[v] == INF64) f_visited.push_back(v);
+                                    f_dist[v] = nd;
+                                    f_heap.push(nd, v);
                                 }
                             }
                         }
@@ -328,11 +325,13 @@ int main(int argc, char* argv[]) {
                             uint32_t v = rev_edges[e].to;
                             uint64_t nd = d + rev_edges[e].w;
                             if (nd < r_dist[v]) {
-                                if (r_dist[v] == INF64) r_visited.push_back(v);
-                                r_dist[v] = nd;
-                                r_heap.push(nd, v);
                                 if (f_dist[v] != INF64 && nd + f_dist[v] < mu) {
                                     mu = nd + f_dist[v];
+                                }
+                                if (nd < mu) {
+                                    if (r_dist[v] == INF64) r_visited.push_back(v);
+                                    r_dist[v] = nd;
+                                    r_heap.push(nd, v);
                                 }
                             }
                         }

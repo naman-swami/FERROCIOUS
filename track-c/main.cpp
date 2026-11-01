@@ -1,6 +1,3 @@
-// FERROCIOUS Track C — 12-Thread Lock-Free Bitset Join Engine (specs/c-join.md)
-// Zero External Dependencies (D = 1.00). C++20.
-
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -87,7 +84,7 @@ struct PoolSlot {
 };
 
 static PoolSlot pool_table[POOL_CAP];
-static char pool_arena[8 * 1024 * 1024]; // 8 MB fixed arena, never reallocates
+static char pool_arena[8 * 1024 * 1024]; // 8 MB fixed arena
 static std::atomic<uint32_t> pool_arena_size{0};
 static std::atomic<uint32_t> pool_next_id{0};
 
@@ -101,7 +98,6 @@ inline uint32_t get_or_register_name(const char* s, size_t len) {
         if (st == 0) {
             uint32_t expected = 0;
             if (pool_table[idx].state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
-                // Claimed slot
                 uint32_t off = pool_arena_size.fetch_add((uint32_t)len, std::memory_order_relaxed);
                 std::memcpy(pool_arena + off, s, len);
                 uint32_t nid = pool_next_id.fetch_add(1, std::memory_order_relaxed);
@@ -143,6 +139,33 @@ struct ThreadStats {
 
 static constexpr size_t BITSET_WORDS = 2048;
 
+struct FastCountryMap {
+    struct Slot {
+        uint32_t code = 0;
+        uint16_t cid = 0xFFFF;
+    };
+    Slot table[1024];
+
+    FastCountryMap() {
+        std::memset(table, 0, sizeof(table));
+    }
+
+    uint16_t get_or_insert(uint32_t code, const char* str_ptr, size_t clen, std::vector<std::string>& country_names) {
+        size_t idx = (code * 0x9E3779B9u) & 1023;
+        while (table[idx].code != 0) {
+            if (table[idx].code == code) return table[idx].cid;
+            idx = (idx + 1) & 1023;
+        }
+        table[idx].code = code;
+        uint16_t cid = (uint16_t)country_names.size();
+        table[idx].cid = cid;
+        country_names.push_back(std::string(str_ptr, clen));
+        return cid;
+    }
+};
+
+static uint16_t region_to_country[1000000];
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -158,16 +181,16 @@ int main(int argc, char* argv[]) {
 
     get_or_register_name("", 0);
 
-    // 1. Ingest regions.csv
+    // 1. Ingest regions.csv with FastCountryMap and 1M array
+    std::memset(region_to_country, 0xFF, sizeof(region_to_country));
     std::vector<std::string> country_names;
-    std::vector<uint16_t> region_to_country_id(10000000, 0xFFFF);
+    FastCountryMap cmap;
     uint16_t unmatched_cid = 0xFFFF;
 
     {
         ferocious::MappedFile rmf(regions_path.c_str());
         if (!rmf.ok) return 1;
 
-        std::map<std::string, uint16_t> country_to_id;
         const char* p = static_cast<const char*>(rmf.data);
         const char* end = p + rmf.size;
 
@@ -184,20 +207,17 @@ int main(int argc, char* argv[]) {
             if (p < end && *p == ',') p++;
             const char* cstart = p;
             while (p < end && *p != '\r' && *p != '\n') p++;
-            std::string ccode(cstart, p - cstart);
+            size_t clen = p - cstart;
 
-            auto it = country_to_id.find(ccode);
-            uint16_t cid;
-            if (it == country_to_id.end()) {
-                cid = (uint16_t)country_names.size();
-                country_to_id[ccode] = cid;
-                country_names.push_back(ccode);
+            uint32_t code = 0;
+            if (clen == 3) {
+                code = (uint8_t)cstart[0] | ((uint8_t)cstart[1] << 8) | ((uint8_t)cstart[2] << 16);
             } else {
-                cid = it->second;
+                for (size_t i = 0; i < clen && i < 4; ++i) code |= ((uint8_t)cstart[i] << (i * 8));
             }
 
-            if (rid >= region_to_country_id.size()) region_to_country_id.resize(rid + 100000, 0xFFFF);
-            region_to_country_id[rid] = cid;
+            uint16_t cid = cmap.get_or_insert(code, cstart, clen, country_names);
+            if (rid < 1000000) region_to_country[rid] = cid;
 
             if (p < end && *p == '\r') p++;
             if (p < end && *p == '\n') p++;
@@ -355,7 +375,7 @@ int main(int argc, char* argv[]) {
                 if (p < end && *p == '\r') p++;
                 if (p < end && *p == '\n') p++;
 
-                uint16_t cid = (reg_id < region_to_country_id.size()) ? region_to_country_id[reg_id] : unmatched_cid;
+                uint16_t cid = (reg_id < 1000000) ? region_to_country[reg_id] : unmatched_cid;
                 if (cid == 0xFFFF) cid = unmatched_cid;
 
                 auto& cs = stats[cid];
