@@ -131,6 +131,37 @@ inline uint32_t get_or_register_name(const char* s, size_t len) {
     }
 }
 
+// Thread-Local Cache for instant lock-free resolution of repeated customer names
+struct LocalNameCache {
+    static constexpr size_t CAP = 16384;
+    static constexpr size_t MASK = CAP - 1;
+    struct Entry {
+        uint64_t hash = 0;
+        uint32_t len = 0;
+        uint32_t name_id = 0;
+        char str[64];
+    };
+    std::vector<Entry> table;
+    LocalNameCache() : table(CAP) {}
+
+    inline uint32_t get_or_register(const char* s, size_t len) {
+        if (len >= 64) return get_or_register_name(s, len);
+        uint64_t h = hash_bytes(s, len);
+        if (h == 0) h = 1;
+        size_t idx = h & MASK;
+        Entry& e = table[idx];
+        if (e.hash == h && e.len == len && std::memcmp(e.str, s, len) == 0) {
+            return e.name_id;
+        }
+        uint32_t nid = get_or_register_name(s, len);
+        e.hash = h;
+        e.len = (uint32_t)len;
+        e.name_id = nid;
+        std::memcpy(e.str, s, len);
+        return nid;
+    }
+};
+
 struct ThreadStats {
     uint64_t count = 0;
     int64_t id_sum = 0;
@@ -263,6 +294,7 @@ int main(int argc, char* argv[]) {
     std::vector<std::thread> workers;
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
+            LocalNameCache local_cache;
             const char* p = data + chunk_starts[tid];
             const char* end = data + chunk_ends[tid];
             auto& stats = thread_stats[tid];
@@ -367,7 +399,7 @@ int main(int argc, char* argv[]) {
                 cs.name_bytes += name_len;
                 cs.note_bytes += note_len;
 
-                uint32_t nid = get_or_register_name(name_ptr, name_len);
+                uint32_t nid = local_cache.get_or_register(name_ptr, name_len);
                 seen[cid * BITSET_WORDS + (nid >> 6)] |= (1ULL << (nid & 63));
             }
         });
