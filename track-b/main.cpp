@@ -90,13 +90,13 @@ int main(int argc, char* argv[]) {
 
     // 1. Parse all queries to extract query lines and active vocabulary
     std::vector<std::string_view> query_lines;
-    std::unordered_map<std::string, uint16_t, TransparentStringHash, std::equal_to<>> token_to_id;
-    token_to_id.reserve(32768);
+    std::unordered_map<std::string, uint32_t, TransparentStringHash, std::equal_to<>> token_to_id;
+    token_to_id.reserve(131072);
 
-    auto get_or_add_token = [&](std::string_view sv) -> uint16_t {
+    auto get_or_add_token = [&](std::string_view sv) -> uint32_t {
         auto it = token_to_id.find(sv);
         if (it != token_to_id.end()) return it->second;
-        uint16_t new_id = static_cast<uint16_t>(token_to_id.size());
+        uint32_t new_id = static_cast<uint32_t>(token_to_id.size());
         token_to_id.emplace(std::string(sv), new_id);
         return new_id;
     };
@@ -107,6 +107,9 @@ int main(int argc, char* argv[]) {
         while (p < end) {
             const char* qend = static_cast<const char*>(std::memchr(p, '\n', end - p));
             if (!qend) qend = end;
+            const char* next_p = (qend < end) ? qend + 1 : end;
+            while (qend > p && (qend[-1] == '\r' || qend[-1] == ' ' || qend[-1] == '\t')) qend--;
+
             if (qend > p) {
                 std::string_view qline(p, qend - p);
                 query_lines.push_back(qline);
@@ -138,11 +141,11 @@ int main(int argc, char* argv[]) {
                     }
                 }
             }
-            p = (qend < end) ? qend + 1 : end;
+            p = next_p;
         }
     }
 
-    uint16_t num_active_tokens = static_cast<uint16_t>(token_to_id.size());
+    uint32_t num_active_tokens = static_cast<uint32_t>(token_to_id.size());
 
     // 2. Pre-scan docs to find doc boundaries and line pointers
     struct DocSpan {
@@ -158,19 +161,22 @@ int main(int argc, char* argv[]) {
         while (cur < docs_end) {
             const char* line_end = static_cast<const char*>(std::memchr(cur, '\n', docs_end - cur));
             if (!line_end) line_end = docs_end;
+            const char* next_cur = (line_end < docs_end) ? line_end + 1 : docs_end;
+            while (line_end > cur && (line_end[-1] == '\r' || line_end[-1] == ' ' || line_end[-1] == '\t')) line_end--;
 
             const char* tab_pos = static_cast<const char*>(std::memchr(cur, '\t', line_end - cur));
             if (tab_pos) {
                 doc_spans.push_back({tab_pos + 1, line_end});
+            } else {
+                doc_spans.push_back({cur, cur});
             }
-            cur = (line_end < docs_end) ? line_end + 1 : docs_end;
+            cur = next_cur;
         }
     }
 
     size_t total_docs = doc_spans.size();
 
     // 3. Parallel Tokenization and Posting Indexing
-    // Each thread maintains a vector of vector<uint32_t> for each active token
     std::vector<std::vector<std::vector<uint32_t>>> thread_indexes(num_threads);
     for (unsigned tid = 0; tid < num_threads; ++tid) {
         thread_indexes[tid].resize(num_active_tokens);
@@ -189,7 +195,7 @@ int main(int argc, char* argv[]) {
             auto& local_index = thread_indexes[tid];
             std::string lower_token;
             lower_token.reserve(128);
-            std::vector<uint16_t> doc_active_ids;
+            std::vector<uint32_t> doc_active_ids;
             doc_active_ids.reserve(64);
 
             for (size_t doc_id = start_id; doc_id < end_id; ++doc_id) {
@@ -216,8 +222,10 @@ int main(int argc, char* argv[]) {
                     std::sort(doc_active_ids.begin(), doc_active_ids.end());
                     doc_active_ids.erase(std::unique(doc_active_ids.begin(), doc_active_ids.end()), doc_active_ids.end());
 
-                    for (uint16_t tok_id : doc_active_ids) {
-                        local_index[tok_id].push_back(static_cast<uint32_t>(doc_id));
+                    for (uint32_t tok_id : doc_active_ids) {
+                        if (tok_id < num_active_tokens) {
+                            local_index[tok_id].push_back(static_cast<uint32_t>(doc_id));
+                        }
                     }
                 }
             }
@@ -228,7 +236,7 @@ int main(int argc, char* argv[]) {
 
     // 4. Merge thread posting lists into global inverted index
     std::vector<std::vector<uint32_t>> global_index(num_active_tokens);
-    for (uint16_t tok_id = 0; tok_id < num_active_tokens; ++tok_id) {
+    for (uint32_t tok_id = 0; tok_id < num_active_tokens; ++tok_id) {
         size_t total_p = 0;
         for (unsigned tid = 0; tid < num_threads; ++tid) {
             total_p += thread_indexes[tid][tok_id].size();
@@ -239,7 +247,6 @@ int main(int argc, char* argv[]) {
             global_index[tok_id].insert(global_index[tok_id].end(), pt.begin(), pt.end());
         }
     }
-    // Free thread indexes
     thread_indexes.clear();
     thread_indexes.shrink_to_fit();
 
@@ -293,7 +300,7 @@ int main(int argc, char* argv[]) {
                     std::vector<uint32_t>* next_buf = &buf_b;
                     cur_buf->clear();
 
-                    if (it0 != token_to_id.end()) {
+                    if (it0 != token_to_id.end() && it0->second < global_index.size()) {
                         *cur_buf = global_index[it0->second];
                     }
 
@@ -302,7 +309,7 @@ int main(int argc, char* argv[]) {
                         std::string_view term = parts[i + 1];
 
                         auto post_it = token_to_id.find(term);
-                        const std::vector<uint32_t>* postings = (post_it != token_to_id.end()) ? &global_index[post_it->second] : nullptr;
+                        const std::vector<uint32_t>* postings = (post_it != token_to_id.end() && post_it->second < global_index.size()) ? &global_index[post_it->second] : nullptr;
 
                         next_buf->clear();
                         if (op == "AND") {
@@ -372,14 +379,14 @@ int main(int argc, char* argv[]) {
                     std::vector<uint32_t>* next_cand = &buf_b;
                     cur_cand->clear();
 
-                    if (it0 != token_to_id.end()) {
+                    if (it0 != token_to_id.end() && it0->second < global_index.size()) {
                         *cur_cand = global_index[it0->second];
                     }
 
                     bool possible = !cur_cand->empty();
                     for (size_t i = 1; i < phrase_terms.size() && possible; ++i) {
                         auto pit = token_to_id.find(phrase_terms[i]);
-                        if (pit == token_to_id.end()) {
+                        if (pit == token_to_id.end() || pit->second >= global_index.size()) {
                             cur_cand->clear();
                             possible = false;
                             break;
@@ -397,7 +404,10 @@ int main(int argc, char* argv[]) {
                     std::vector<uint32_t> matches;
 
                     for (uint32_t doc_id : *cur_cand) {
+                        if (doc_id >= doc_spans.size()) continue;
                         const auto& span = doc_spans[doc_id];
+                        if (span.start == nullptr || span.end <= span.start) continue;
+
                         size_t doc_len = span.end - span.start;
                         phrase_buf.resize(doc_len);
                         char* buf_p = phrase_buf.data();
