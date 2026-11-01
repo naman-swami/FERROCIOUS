@@ -1,3 +1,6 @@
+// FERROCIOUS Track D — Ultra-Low-Memory CSR + Hole-Shifting 4-ary MinHeap Bidirectional Dijkstra
+// Zero External Dependencies (D = 1.00). C++20.
+
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -5,7 +8,6 @@
 #include <algorithm>
 #include <thread>
 #include <atomic>
-#include <cstring>
 #include "ferocious_common.hpp"
 
 namespace {
@@ -17,6 +19,7 @@ struct HeapItem {
     uint32_t u;
 };
 
+// Ultra-Fast 4-ary Min-Heap with Hole Shifting (Zero intermediate swaps)
 struct MinHeap4 {
     std::vector<HeapItem> data;
 
@@ -74,14 +77,9 @@ struct MinHeap4 {
     }
 };
 
+// Compact 8-byte HalfEdge for L1/L2 cache locality
 struct HalfEdge {
     uint32_t to;
-    uint32_t w;
-};
-
-struct EdgeTuple {
-    uint32_t u;
-    uint32_t v;
     uint32_t w;
 };
 
@@ -98,153 +96,152 @@ int main(int argc, char* argv[]) {
     std::string queries_path = data_dir + "/queries.txt";
     std::string distances_path = out_dir + "/distances.txt";
 
+    ferocious::MappedFile gmf(graph_path.c_str());
+    if (!gmf.ok) return 1;
+
+    const char* gp = static_cast<const char*>(gmf.data);
+    const char* gend = gp + gmf.size;
+
+    while (gp < gend && (*gp == ' ' || *gp == '\t' || *gp == '\r' || *gp == '\n')) gp++;
     uint32_t n = 0, m = 0;
-    std::vector<uint32_t> fwd_head;
-    std::vector<uint32_t> rev_head;
-    std::vector<HalfEdge> fwd_edges;
-    std::vector<HalfEdge> rev_edges;
+    while (gp < gend && *gp >= '0' && *gp <= '9') n = n * 10 + (*gp++ - '0');
+    while (gp < gend && (*gp == ' ' || *gp == '\t')) gp++;
+    while (gp < gend && *gp >= '0' && *gp <= '9') m = m * 10 + (*gp++ - '0');
+    while (gp < gend && *gp != '\n') gp++;
+    if (gp < gend && *gp == '\n') gp++;
+
+    const char* start_p = gp;
+    size_t total_edge_bytes = gend - start_p;
 
     unsigned int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 6;
     if (num_threads > 12) num_threads = 12;
 
-    // 1. Ingest graph.txt with 1-Pass Thread-Local Buffering
-    {
-        ferocious::MappedFile gmf(graph_path.c_str());
-        if (!gmf.ok) return 1;
+    std::vector<const char*> chunk_starts(num_threads);
+    std::vector<const char*> chunk_ends(num_threads);
+    size_t chunk_bytes = total_edge_bytes / num_threads;
 
-        const char* gp = static_cast<const char*>(gmf.data);
-        const char* gend = gp + gmf.size;
+    for (unsigned int tid = 0; tid < num_threads; ++tid) {
+        const char* s = start_p + tid * chunk_bytes;
+        const char* e = (tid == num_threads - 1) ? gend : start_p + (tid + 1) * chunk_bytes;
+        if (tid > 0) { while (s < gend && *s != '\n') s++; if (s < gend) s++; }
+        if (tid < num_threads - 1) { while (e < gend && *e != '\n') e++; if (e < gend) e++; }
+        chunk_starts[tid] = s;
+        chunk_ends[tid] = e;
+    }
 
-        while (gp < gend && (*gp == ' ' || *gp == '\t' || *gp == '\r' || *gp == '\n')) gp++;
-        while (gp < gend && *gp >= '0' && *gp <= '9') n = n * 10 + (*gp++ - '0');
-        while (gp < gend && (*gp == ' ' || *gp == '\t')) gp++;
-        while (gp < gend && *gp >= '0' && *gp <= '9') m = m * 10 + (*gp++ - '0');
-        while (gp < gend && *gp != '\n') gp++;
-        if (gp < gend && *gp == '\n') gp++;
+    std::vector<std::atomic<uint32_t>> fwd_degree(n + 2);
+    std::vector<std::atomic<uint32_t>> rev_degree(n + 2);
+    for (uint32_t i = 0; i <= n + 1; ++i) {
+        fwd_degree[i].store(0, std::memory_order_relaxed);
+        rev_degree[i].store(0, std::memory_order_relaxed);
+    }
 
-        const char* start_p = gp;
-        size_t total_edge_bytes = gend - start_p;
+    // 1. Pass 1: Parse degrees directly into atomic counters (Zero edge buffer allocation)
+    std::vector<std::thread> workers;
+    for (unsigned int tid = 0; tid < num_threads; ++tid) {
+        workers.emplace_back([&, tid]() {
+            const char* p = chunk_starts[tid];
+            const char* limit = chunk_ends[tid];
+            while (p < limit) {
+                while (p < limit && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+                if (p >= limit) break;
+                uint32_t u = 0;
+                while (p < limit && *p >= '0' && *p <= '9') u = u * 10 + (*p++ - '0');
+                while (p < limit && (*p == ' ' || *p == '\t')) p++;
+                uint32_t v = 0;
+                while (p < limit && *p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+                while (p < limit && *p != '\n') p++;
+                if (p < limit && *p == '\n') p++;
 
-        std::vector<const char*> chunk_starts(num_threads);
-        std::vector<const char*> chunk_ends(num_threads);
-        size_t chunk_bytes = total_edge_bytes / num_threads;
+                fwd_degree[u + 1].fetch_add(1, std::memory_order_relaxed);
+                rev_degree[v + 1].fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    workers.clear();
 
-        for (unsigned int tid = 0; tid < num_threads; ++tid) {
-            const char* s = start_p + tid * chunk_bytes;
-            const char* e = (tid == num_threads - 1) ? gend : start_p + (tid + 1) * chunk_bytes;
-            if (tid > 0) { while (s < gend && *s != '\n') s++; if (s < gend) s++; }
-            if (tid < num_threads - 1) { while (e < gend && *e != '\n') e++; if (e < gend) e++; }
-            chunk_starts[tid] = s;
-            chunk_ends[tid] = e;
-        }
+    // 2. Prefix Sums
+    std::vector<uint32_t> fwd_head(n + 2, 0);
+    std::vector<uint32_t> rev_head(n + 2, 0);
+    std::vector<std::atomic<uint32_t>> cur_fwd(n + 2);
+    std::vector<std::atomic<uint32_t>> cur_rev(n + 2);
 
-        std::vector<std::atomic<uint32_t>> fwd_degree(n + 2);
-        std::vector<std::atomic<uint32_t>> rev_degree(n + 2);
-        for (uint32_t i = 0; i <= n + 1; ++i) {
-            fwd_degree[i].store(0, std::memory_order_relaxed);
-            rev_degree[i].store(0, std::memory_order_relaxed);
-        }
+    for (uint32_t i = 0; i <= n; ++i) {
+        fwd_head[i + 1] = fwd_head[i] + fwd_degree[i + 1].load(std::memory_order_relaxed);
+        rev_head[i + 1] = rev_head[i] + rev_degree[i + 1].load(std::memory_order_relaxed);
+        cur_fwd[i].store(fwd_head[i], std::memory_order_relaxed);
+        cur_rev[i].store(rev_head[i], std::memory_order_relaxed);
+    }
+    std::vector<std::atomic<uint32_t>>().swap(fwd_degree);
+    std::vector<std::atomic<uint32_t>>().swap(rev_degree);
 
-        std::vector<std::vector<EdgeTuple>> thread_edges(num_threads);
+    std::vector<HalfEdge> fwd_edges(m);
+    std::vector<HalfEdge> rev_edges(m);
 
-        // Pass 1: Parse ASCII edges ONCE, record degrees and buffer in thread_edges
-        std::vector<std::thread> workers;
-        for (unsigned int tid = 0; tid < num_threads; ++tid) {
-            workers.emplace_back([&, tid]() {
-                thread_edges[tid].reserve((m / num_threads) + 65536);
-                const char* p = chunk_starts[tid];
-                const char* limit = chunk_ends[tid];
-                while (p < limit) {
-                    while (p < limit && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
-                    if (p >= limit) break;
-                    uint32_t u = 0;
-                    while (p < limit && *p >= '0' && *p <= '9') u = u * 10 + (*p++ - '0');
-                    while (p < limit && (*p == ' ' || *p == '\t')) p++;
-                    uint32_t v = 0;
-                    while (p < limit && *p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
-                    while (p < limit && (*p == ' ' || *p == '\t')) p++;
-                    uint32_t w = 0;
-                    while (p < limit && *p >= '0' && *p <= '9') w = w * 10 + (*p++ - '0');
-                    while (p < limit && *p != '\n') p++;
-                    if (p < limit && *p == '\n') p++;
+    // 3. Pass 2: Parallel Direct Scatter into compact HalfEdge arrays
+    for (unsigned int tid = 0; tid < num_threads; ++tid) {
+        workers.emplace_back([&, tid]() {
+            const char* p = chunk_starts[tid];
+            const char* limit = chunk_ends[tid];
+            while (p < limit) {
+                while (p < limit && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+                if (p >= limit) break;
+                uint32_t u = 0;
+                while (p < limit && *p >= '0' && *p <= '9') u = u * 10 + (*p++ - '0');
+                while (p < limit && (*p == ' ' || *p == '\t')) p++;
+                uint32_t v = 0;
+                while (p < limit && *p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+                while (p < limit && (*p == ' ' || *p == '\t')) p++;
+                uint32_t w = 0;
+                while (p < limit && *p >= '0' && *p <= '9') w = w * 10 + (*p++ - '0');
+                while (p < limit && *p != '\n') p++;
+                if (p < limit && *p == '\n') p++;
 
-                    thread_edges[tid].push_back({u, v, w});
-                    fwd_degree[u + 1].fetch_add(1, std::memory_order_relaxed);
-                    rev_degree[v + 1].fetch_add(1, std::memory_order_relaxed);
-                }
-            });
-        }
-        for (auto& w : workers) w.join();
-        workers.clear();
+                uint32_t fp = cur_fwd[u].fetch_add(1, std::memory_order_relaxed);
+                fwd_edges[fp] = {v, w};
 
-        // Pass 2: Prefix Sums
-        fwd_head.assign(n + 2, 0);
-        rev_head.assign(n + 2, 0);
-        std::vector<std::atomic<uint32_t>> cur_fwd(n + 2);
-        std::vector<std::atomic<uint32_t>> cur_rev(n + 2);
+                uint32_t rp = cur_rev[v].fetch_add(1, std::memory_order_relaxed);
+                rev_edges[rp] = {u, w};
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    workers.clear();
+    std::vector<std::atomic<uint32_t>>().swap(cur_fwd);
+    std::vector<std::atomic<uint32_t>>().swap(cur_rev);
 
-        for (uint32_t i = 0; i <= n; ++i) {
-            fwd_head[i + 1] = fwd_head[i] + fwd_degree[i + 1].load(std::memory_order_relaxed);
-            rev_head[i + 1] = rev_head[i] + rev_degree[i + 1].load(std::memory_order_relaxed);
-            cur_fwd[i].store(fwd_head[i], std::memory_order_relaxed);
-            cur_rev[i].store(rev_head[i], std::memory_order_relaxed);
-        }
-        std::vector<std::atomic<uint32_t>>().swap(fwd_degree);
-        std::vector<std::atomic<uint32_t>>().swap(rev_degree);
+    // 4. Parse queries
+    ferocious::MappedFile qmf(queries_path.c_str());
+    if (!qmf.ok) return 1;
 
-        fwd_edges.resize(m);
-        rev_edges.resize(m);
+    const char* qp = static_cast<const char*>(qmf.data);
+    const char* qend = qp + qmf.size;
 
-        // Pass 3: Parallel Binary Scatter from memory (NO ASCII parsing, NO disk IO)
-        for (unsigned int tid = 0; tid < num_threads; ++tid) {
-            workers.emplace_back([&, tid]() {
-                for (const auto& edge : thread_edges[tid]) {
-                    uint32_t fp = cur_fwd[edge.u].fetch_add(1, std::memory_order_relaxed);
-                    fwd_edges[fp] = {edge.v, edge.w};
-
-                    uint32_t rp = cur_rev[edge.v].fetch_add(1, std::memory_order_relaxed);
-                    rev_edges[rp] = {edge.u, edge.w};
-                }
-                std::vector<EdgeTuple>().swap(thread_edges[tid]);
-            });
-        }
-        for (auto& w : workers) w.join();
-    } // gmf completely unmapped!
-
-    // 2. Parse queries
     std::vector<std::pair<uint32_t, uint32_t>> queries;
-    {
-        ferocious::MappedFile qmf(queries_path.c_str());
-        if (!qmf.ok) return 1;
+    while (qp < qend) {
+        while (qp < qend && (*qp == ' ' || *qp == '\t' || *qp == '\r' || *qp == '\n')) qp++;
+        if (qp >= qend) break;
 
-        const char* qp = static_cast<const char*>(qmf.data);
-        const char* qend = qp + qmf.size;
+        uint32_t s = 0;
+        while (qp < qend && *qp >= '0' && *qp <= '9') s = s * 10 + (*qp++ - '0');
+        while (qp < qend && (*qp == ' ' || *qp == '\t')) qp++;
 
-        while (qp < qend) {
-            while (qp < qend && (*qp == ' ' || *qp == '\t' || *qp == '\r' || *qp == '\n')) qp++;
-            if (qp >= qend) break;
+        uint32_t t = 0;
+        while (qp < qend && *qp >= '0' && *qp <= '9') t = t * 10 + (*qp++ - '0');
+        while (qp < qend && *qp != '\n') qp++;
+        if (qp < qend && *qp == '\n') qp++;
 
-            uint32_t s = 0;
-            while (qp < qend && *qp >= '0' && *qp <= '9') s = s * 10 + (*qp++ - '0');
-            while (qp < qend && (*qp == ' ' || *qp == '\t')) qp++;
-
-            uint32_t t = 0;
-            while (qp < qend && *qp >= '0' && *qp <= '9') t = t * 10 + (*qp++ - '0');
-            while (qp < qend && *qp != '\n') qp++;
-            if (qp < qend && *qp == '\n') qp++;
-
-            queries.push_back({s, t});
-        }
-    } // qmf unmapped!
+        queries.push_back({s, t});
+    }
 
     size_t num_queries = queries.size();
     std::vector<int64_t> answers(num_queries, -1);
     std::atomic<size_t> query_idx{0};
 
-    // 3. Parallel Bidirectional Dijkstra (6 dedicated P-core threads for maximum cache hit rate)
+    // 5. Parallel Bidirectional Dijkstra (6 dedicated P-core threads for maximum CPU throughput & low memory)
     unsigned int query_threads = std::min(num_threads, 6u);
-    std::vector<std::thread> workers;
     for (unsigned int tid = 0; tid < query_threads; ++tid) {
         workers.emplace_back([&]() {
             std::vector<uint64_t> f_dist(n, INF64);
@@ -345,7 +342,7 @@ int main(int argc, char* argv[]) {
 
     for (auto& w : workers) w.join();
 
-    // 4. Write distances.txt
+    // 6. Write distances.txt
     #ifdef _WIN32
     CreateDirectoryA(out_dir.c_str(), NULL);
     #endif
