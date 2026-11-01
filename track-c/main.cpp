@@ -1,4 +1,4 @@
-// FERROCIOUS Track C — High Performance Flat-Table CSV Engine (specs/c-join.md)
+// FERROCIOUS Track C — 12-Thread Lock-Free Bitset Join Engine (specs/c-join.md)
 // Zero External Dependencies (D = 1.00). C++20.
 
 #include <iostream>
@@ -10,6 +10,10 @@
 #include <cstdint>
 #include <map>
 #include <algorithm>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <bit>
 #include "ferocious_common.hpp"
 
 namespace {
@@ -58,58 +62,72 @@ inline int64_t parse_cents_strict(const char* p, const char* end) {
     return neg ? -total : total;
 }
 
-// Flat open-addressing string pool
-struct StringPool {
-    static constexpr size_t HASH_CAP = 262144; // 2^18, > 2x max names (100k)
-    static constexpr size_t MASK = HASH_CAP - 1;
-
-    struct Entry {
-        uint32_t offset = 0;
-        uint32_t len = 0;
-        uint32_t id = 0;
-    };
-
-    std::vector<char> arena;
-    std::vector<Entry> table;
-    uint32_t next_id = 0;
-
-    StringPool() : table(HASH_CAP) {
-        arena.reserve(4 * 1024 * 1024);
+inline uint64_t hash_bytes(const char* p, size_t len) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < len; ++i) {
+        h ^= (uint8_t)p[i];
+        h *= 0x100000001b3ULL;
     }
+    return h;
+}
 
-    static inline uint64_t hash_bytes(const char* p, size_t len) {
-        uint64_t h = 0xcbf29ce484222325ULL;
-        for (size_t i = 0; i < len; ++i) {
-            h ^= (uint8_t)p[i];
-            h *= 0x100000001b3ULL;
-        }
-        return h;
-    }
+static constexpr size_t POOL_CAP = 262144;
+static constexpr size_t POOL_MASK = POOL_CAP - 1;
 
-    inline uint32_t get_or_insert(const char* s, size_t len) {
-        uint64_t h = hash_bytes(s, len);
-        size_t idx = h & MASK;
-
-        while (true) {
-            Entry& e = table[idx];
-            if (e.len == 0 && e.id == 0 && (idx != 0 || next_id != 0)) {
-                // Empty slot found
-                uint32_t off = (uint32_t)arena.size();
-                arena.insert(arena.end(), s, s + len);
-                e.offset = off;
-                e.len = (uint32_t)len;
-                e.id = next_id++;
-                return e.id;
-            }
-
-            if (e.len == len && std::memcmp(arena.data() + e.offset, s, len) == 0) {
-                return e.id;
-            }
-
-            idx = (idx + 1) & MASK;
-        }
-    }
+struct PoolSlot {
+    std::atomic<uint64_t> hash{0};
+    uint32_t offset = 0;
+    uint32_t len = 0;
+    uint32_t name_id = 0;
 };
+
+static PoolSlot pool_table[POOL_CAP];
+static char pool_arena[8 * 1024 * 1024]; // 8 MB fixed arena, never reallocates
+static uint32_t pool_arena_size = 0;
+static std::mutex pool_mutex;
+static uint32_t pool_next_id = 0;
+
+inline uint32_t get_or_register_name(const char* s, size_t len) {
+    uint64_t h = hash_bytes(s, len);
+    if (h == 0) h = 1;
+
+    size_t idx = h & POOL_MASK;
+    while (true) {
+        uint64_t cur_h = pool_table[idx].hash.load(std::memory_order_acquire);
+        if (cur_h == 0) {
+            std::lock_guard<std::mutex> lock(pool_mutex);
+            if (pool_table[idx].hash.load(std::memory_order_relaxed) == 0) {
+                uint32_t off = pool_arena_size;
+                std::memcpy(pool_arena + off, s, len);
+                pool_arena_size += (uint32_t)len;
+                uint32_t nid = pool_next_id++;
+                pool_table[idx].offset = off;
+                pool_table[idx].len = (uint32_t)len;
+                pool_table[idx].name_id = nid;
+                pool_table[idx].hash.store(h, std::memory_order_release);
+                return nid;
+            }
+            cur_h = pool_table[idx].hash.load(std::memory_order_acquire);
+        }
+        if (cur_h == h && pool_table[idx].len == len &&
+            std::memcmp(pool_arena + pool_table[idx].offset, s, len) == 0) {
+            return pool_table[idx].name_id;
+        }
+        idx = (idx + 1) & POOL_MASK;
+    }
+}
+
+struct ThreadStats {
+    uint64_t count = 0;
+    int64_t id_sum = 0;
+    int64_t amount_sum = 0;
+    int64_t amount_min = INT64_MAX;
+    int64_t amount_max = INT64_MIN;
+    uint64_t name_bytes = 0;
+    uint64_t note_bytes = 0;
+};
+
+static constexpr size_t BITSET_WORDS = 2048;
 
 } // namespace
 
@@ -120,11 +138,13 @@ int main(int argc, char* argv[]) {
     std::string data_dir = (argc > 1) ? argv[1] : "/data";
     std::string out_dir  = (argc > 2) ? argv[2] : "/out";
 
-    std::string records_path = data_dir + "/records.csv";
     std::string regions_path = data_dir + "/regions.csv";
+    std::string records_path = data_dir + "/records.csv";
     std::string aggregates_path = out_dir + "/aggregates.txt";
 
-    // 1. Regions: map country names to country_ids (0..240)
+    get_or_register_name("", 0);
+
+    // 1. Ingest regions.csv
     std::vector<std::string> country_names;
     std::vector<uint16_t> region_to_country_id(10000000, 0xFFFF);
     uint16_t unmatched_cid = 0xFFFF;
@@ -134,7 +154,6 @@ int main(int argc, char* argv[]) {
         if (!rmf.ok) return 1;
 
         std::map<std::string, uint16_t> country_to_id;
-
         const char* p = static_cast<const char*>(rmf.data);
         const char* end = p + rmf.size;
 
@@ -175,156 +194,209 @@ int main(int argc, char* argv[]) {
     }
 
     uint16_t num_countries = (uint16_t)country_names.size();
-    std::vector<CountryStats> stats(num_countries);
 
-    // Bitsets for seen names per country: 131,072 bits / 64 = 2048 uint64_t per country
-    static constexpr size_t BITSET_WORDS = 2048; // up to 131,072 distinct names
-    std::vector<std::vector<uint64_t>> seen_names(num_countries, std::vector<uint64_t>(BITSET_WORDS, 0));
-
-    StringPool pool;
-    // Pre-insert empty string as id 0
-    pool.get_or_insert("", 0);
-
-    // 2. Records
+    // 2. Open records.csv
     ferocious::MappedFile mf(records_path.c_str());
     if (!mf.ok) return 1;
 
-    const char* p = static_cast<const char*>(mf.data);
-    const char* end = p + mf.size;
+    const char* data = static_cast<const char*>(mf.data);
+    size_t total_size = mf.size;
 
-    if (end - p >= 3 && (uint8_t)p[0] == 0xEF && (uint8_t)p[1] == 0xBB && (uint8_t)p[2] == 0xBF) {
-        p += 3;
+    size_t data_start = 0;
+    if (total_size >= 3 && (uint8_t)data[0] == 0xEF && (uint8_t)data[1] == 0xBB && (uint8_t)data[2] == 0xBF) {
+        data_start = 3;
     }
-    const char* hdr_end = static_cast<const char*>(std::memchr(p, '\n', end - p));
-    if (hdr_end) p = hdr_end + 1;
+    const char* hdr_nl = static_cast<const char*>(std::memchr(data + data_start, '\n', total_size - data_start));
+    if (hdr_nl) data_start = (hdr_nl - data) + 1;
 
-    char unescape_buf[1024];
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 6;
+    if (num_threads > 12) num_threads = 12;
 
-    while (p < end) {
-        if (end - p >= 3 && (uint8_t)p[0] == 0xEF && (uint8_t)p[1] == 0xBB && (uint8_t)p[2] == 0xBF) {
-            p += 3;
-        }
-        if (p >= end || *p == '\r' || *p == '\n') {
-            if (p < end) p++;
-            continue;
-        }
+    size_t chunk_bytes = (total_size - data_start) / num_threads;
 
-        int64_t rec_id = 0;
-        while (p < end && *p >= '0' && *p <= '9') {
-            rec_id = rec_id * 10 + (*p - '0');
-            p++;
-        }
-        if (p < end && *p == ',') p++;
+    std::vector<size_t> chunk_starts(num_threads);
+    std::vector<size_t> chunk_ends(num_threads);
 
-        // Field 2: name
-        const char* name_ptr = nullptr;
-        uint32_t name_len = 0;
-        if (p < end && *p == '"') {
-            p++;
-            char* dest = unescape_buf;
-            while (p < end) {
-                if (*p == '"') {
-                    if (p + 1 < end && *(p + 1) == '"') {
-                        *dest++ = '"';
-                        p += 2;
-                    } else {
-                        p++;
-                        break;
-                    }
-                } else {
-                    *dest++ = *p++;
-                }
+    for (unsigned int tid = 0; tid < num_threads; ++tid) {
+        size_t start = data_start + tid * chunk_bytes;
+        size_t end = (tid == num_threads - 1) ? total_size : data_start + (tid + 1) * chunk_bytes;
+
+        if (tid > 0) {
+            while (start + 1 < total_size && !(data[start] == '\r' && data[start + 1] == '\n')) {
+                start++;
             }
-            name_ptr = unescape_buf;
-            name_len = (uint32_t)(dest - unescape_buf);
-        } else {
-            const char* nstart = p;
-            while (p < end && *p != ',') p++;
-            name_ptr = nstart;
-            name_len = (uint32_t)(p - nstart);
+            if (start + 1 < total_size) start += 2;
+            if (start + 2 < total_size && (uint8_t)data[start] == 0xEF && (uint8_t)data[start+1] == 0xBB && (uint8_t)data[start+2] == 0xBF) {
+                start += 3;
+            }
         }
-        if (p < end && *p == ',') p++;
 
-        // Field 3: note
-        uint64_t note_len = 0;
-        if (p < end && *p == '"') {
-            p++;
+        if (tid < num_threads - 1) {
+            while (end + 1 < total_size && !(data[end] == '\r' && data[end + 1] == '\n')) {
+                end++;
+            }
+            if (end + 1 < total_size) end += 2;
+        }
+
+        chunk_starts[tid] = start;
+        chunk_ends[tid] = end;
+    }
+
+    std::vector<std::vector<ThreadStats>> thread_stats(num_threads, std::vector<ThreadStats>(num_countries));
+    std::vector<std::vector<uint64_t>> thread_seen(num_threads, std::vector<uint64_t>(num_countries * BITSET_WORDS, 0));
+
+    std::vector<std::thread> workers;
+    for (unsigned int tid = 0; tid < num_threads; ++tid) {
+        workers.emplace_back([&, tid]() {
+            const char* p = data + chunk_starts[tid];
+            const char* end = data + chunk_ends[tid];
+            auto& stats = thread_stats[tid];
+            uint64_t* seen = thread_seen[tid].data();
+
+            char unescape_buf[512];
+
             while (p < end) {
-                if (*p == '"') {
-                    if (p + 1 < end && *(p + 1) == '"') {
-                        note_len++;
-                        p += 2;
-                    } else {
-                        p++;
-                        break;
-                    }
-                } else {
-                    note_len++;
+                if (end - p >= 3 && (uint8_t)p[0] == 0xEF && (uint8_t)p[1] == 0xBB && (uint8_t)p[2] == 0xBF) {
+                    p += 3;
+                }
+                if (p >= end || *p == '\r' || *p == '\n') {
+                    if (p < end) p++;
+                    continue;
+                }
+
+                int64_t rec_id = 0;
+                while (p < end && *p >= '0' && *p <= '9') {
+                    rec_id = rec_id * 10 + (*p - '0');
                     p++;
                 }
+                if (p < end && *p == ',') p++;
+
+                const char* name_ptr = nullptr;
+                uint32_t name_len = 0;
+                if (p < end && *p == '"') {
+                    p++;
+                    char* dest = unescape_buf;
+                    while (p < end) {
+                        if (*p == '"') {
+                            if (p + 1 < end && *(p + 1) == '"') {
+                                *dest++ = '"';
+                                p += 2;
+                            } else {
+                                p++;
+                                break;
+                            }
+                        } else {
+                            *dest++ = *p++;
+                        }
+                    }
+                    name_ptr = unescape_buf;
+                    name_len = (uint32_t)(dest - unescape_buf);
+                } else {
+                    const char* nstart = p;
+                    while (p < end && *p != ',') p++;
+                    name_ptr = nstart;
+                    name_len = (uint32_t)(p - nstart);
+                }
+                if (p < end && *p == ',') p++;
+
+                uint64_t note_len = 0;
+                if (p < end && *p == '"') {
+                    p++;
+                    while (p < end) {
+                        if (*p == '"') {
+                            if (p + 1 < end && *(p + 1) == '"') {
+                                note_len++;
+                                p += 2;
+                            } else {
+                                p++;
+                                break;
+                            }
+                        } else {
+                            note_len++;
+                            p++;
+                        }
+                    }
+                } else {
+                    while (p < end && *p != ',') {
+                        note_len++;
+                        p++;
+                    }
+                }
+                if (p < end && *p == ',') p++;
+
+                uint32_t reg_id = 0;
+                while (p < end && *p >= '0' && *p <= '9') {
+                    reg_id = reg_id * 10 + (*p - '0');
+                    p++;
+                }
+                if (p < end && *p == ',') p++;
+
+                const char* amt_start = p;
+                while (p < end && *p != '\r' && *p != '\n') p++;
+                const char* amt_end = p;
+
+                int64_t cents = parse_cents_strict(amt_start, amt_end);
+
+                if (p < end && *p == '\r') p++;
+                if (p < end && *p == '\n') p++;
+
+                uint16_t cid = (reg_id < region_to_country_id.size()) ? region_to_country_id[reg_id] : unmatched_cid;
+                if (cid == 0xFFFF) cid = unmatched_cid;
+
+                auto& cs = stats[cid];
+                cs.count++;
+                cs.id_sum += rec_id;
+                cs.amount_sum += cents;
+                if (cents < cs.amount_min) cs.amount_min = cents;
+                if (cents > cs.amount_max) cs.amount_max = cents;
+                cs.name_bytes += name_len;
+                cs.note_bytes += note_len;
+
+                uint32_t nid = get_or_register_name(name_ptr, name_len);
+                seen[cid * BITSET_WORDS + (nid >> 6)] |= (1ULL << (nid & 63));
             }
-        } else {
-            while (p < end && *p != ',') {
-                note_len++;
-                p++;
+        });
+    }
+
+    for (auto& w : workers) w.join();
+
+    // 3. Merge stats and bitsets across threads
+    std::vector<CountryStats> final_stats(num_countries);
+    for (uint16_t cid = 0; cid < num_countries; ++cid) {
+        auto& fs = final_stats[cid];
+        uint32_t distinct_cnt = 0;
+        size_t base_idx = cid * BITSET_WORDS;
+
+        for (size_t k = 0; k < BITSET_WORDS; ++k) {
+            uint64_t word = 0;
+            for (unsigned int tid = 0; tid < num_threads; ++tid) {
+                word |= thread_seen[tid][base_idx + k];
             }
+            distinct_cnt += std::popcount(word);
         }
-        if (p < end && *p == ',') p++;
+        fs.names_distinct = distinct_cnt;
 
-        // Field 4: region_id
-        uint32_t reg_id = 0;
-        while (p < end && *p >= '0' && *p <= '9') {
-            reg_id = reg_id * 10 + (*p - '0');
-            p++;
-        }
-        if (p < end && *p == ',') p++;
-
-        // Field 5: amount
-        const char* amt_start = p;
-        while (p < end && *p != '\r' && *p != '\n') p++;
-        const char* amt_end = p;
-
-        int64_t cents = parse_cents_strict(amt_start, amt_end);
-
-        if (p < end && *p == '\r') p++;
-        if (p < end && *p == '\n') p++;
-
-        // Country lookup
-        uint16_t cid = (reg_id < region_to_country_id.size()) ? region_to_country_id[reg_id] : unmatched_cid;
-        if (cid == 0xFFFF) cid = unmatched_cid;
-
-        // Distinct name lookup
-        uint32_t name_id = pool.get_or_insert(name_ptr, name_len);
-
-        auto& cs = stats[cid];
-        cs.count++;
-        cs.id_sum += rec_id;
-        cs.amount_sum += cents;
-        if (cents < cs.amount_min) cs.amount_min = cents;
-        if (cents > cs.amount_max) cs.amount_max = cents;
-        cs.name_bytes += name_len;
-        cs.note_bytes += note_len;
-
-        // Bitset test
-        size_t word_idx = name_id >> 6;
-        uint64_t mask = 1ULL << (name_id & 63);
-        if (!(seen_names[cid][word_idx] & mask)) {
-            seen_names[cid][word_idx] |= mask;
-            cs.names_distinct++;
+        for (unsigned int tid = 0; tid < num_threads; ++tid) {
+            const auto& ts = thread_stats[tid][cid];
+            fs.count += ts.count;
+            fs.id_sum += ts.id_sum;
+            fs.amount_sum += ts.amount_sum;
+            if (ts.amount_min < fs.amount_min) fs.amount_min = ts.amount_min;
+            if (ts.amount_max > fs.amount_max) fs.amount_max = ts.amount_max;
+            fs.name_bytes += ts.name_bytes;
+            fs.note_bytes += ts.note_bytes;
         }
     }
 
-    // 3. Emit aggregates.txt sorted by country name
+    // 4. Output
     #ifdef _WIN32
     CreateDirectoryA(out_dir.c_str(), NULL);
     #endif
 
-    // Collect active countries and sort by name
     std::vector<uint16_t> active_cids;
     for (uint16_t cid = 0; cid < num_countries; ++cid) {
-        if (stats[cid].count > 0) {
-            active_cids.push_back(cid);
-        }
+        if (final_stats[cid].count > 0) active_cids.push_back(cid);
     }
     std::sort(active_cids.begin(), active_cids.end(), [&](uint16_t a, uint16_t b) {
         return country_names[a] < country_names[b];
@@ -337,7 +409,7 @@ int main(int argc, char* argv[]) {
 
     for (uint16_t cid : active_cids) {
         const std::string& cname = country_names[cid];
-        const auto& cs = stats[cid];
+        const auto& cs = final_stats[cid];
         out.puts(cname.data(), cname.size());
         out.put(' ');
         out.u64(cs.count);
