@@ -49,11 +49,20 @@ inline uint32_t parse_hour_idx(const char* p) {
     }
 }
 
-inline uint64_t hash_bytes(const char* p, size_t len) {
-    uint64_t h = 0xcbf29ce484222325ULL;
-    for (size_t i = 0; i < len; ++i) {
-        h ^= (uint8_t)p[i];
-        h *= 0x100000001b3ULL;
+// 8-byte fast hash
+inline uint64_t hash_bytes_fast(const char* p, size_t len) {
+    uint64_t h = len * 0x517cc1b727220a95ULL;
+    while (len >= 8) {
+        uint64_t v;
+        std::memcpy(&v, p, 8);
+        h = (h ^ v) * 0x517cc1b727220a95ULL;
+        p += 8;
+        len -= 8;
+    }
+    if (len > 0) {
+        uint64_t v = 0;
+        std::memcpy(&v, p, len);
+        h = (h ^ v) * 0x517cc1b727220a95ULL;
     }
     return h;
 }
@@ -76,7 +85,7 @@ struct LocalDict {
     }
 
     inline uint16_t get_or_insert(const char* p, uint32_t len) {
-        uint64_t h64 = hash_bytes(p, len);
+        uint64_t h64 = hash_bytes_fast(p, len);
         uint32_t h = (uint32_t)(h64 ^ (h64 >> 32));
         if (h == 0) h = 1;
 
@@ -101,45 +110,60 @@ struct LocalDict {
 };
 
 #pragma pack(push, 1)
-struct EpItem {
+struct RawItem {
+    uint8_t  hour_idx;
     uint16_t ep_id;
+    uint8_t  is_error;
     uint32_t latency;
-    uint8_t is_error;
 };
 #pragma pack(pop)
 
-inline uint32_t nearest_rank_percentile(const std::vector<uint32_t>& sorted_vals, uint32_t p) {
-    size_t n = sorted_vals.size();
+inline uint32_t nearest_rank_percentile_slice(const uint32_t* sorted_vals, size_t n, uint32_t p) {
     size_t rank = (p * n + 99) / 100;
     return sorted_vals[rank - 1];
 }
 
-inline void fast_append_u32(std::string& s, uint32_t val) {
+inline char* write_u32(char* p, uint32_t val) {
     char buf[16];
-    char* p = buf + 16;
+    char* cur = buf + 16;
     if (val == 0) {
-        s.push_back('0');
-        return;
+        *p++ = '0';
+        return p;
     }
     while (val > 0) {
-        *--p = '0' + (val % 10);
+        *--cur = '0' + (val % 10);
         val /= 10;
     }
-    s.append(p, (buf + 16) - p);
+    size_t len = (buf + 16) - cur;
+    std::memcpy(p, cur, len);
+    return p + len;
 }
 
-inline void fast_append_u64(std::string& s, uint64_t val) {
+inline char* write_u64(char* p, uint64_t val) {
     char buf[32];
-    char* p = buf + 32;
+    char* cur = buf + 32;
     if (val == 0) {
-        s.push_back('0');
-        return;
+        *p++ = '0';
+        return p;
     }
     while (val > 0) {
-        *--p = '0' + (val % 10);
+        *--cur = '0' + (val % 10);
         val /= 10;
     }
-    s.append(p, (buf + 32) - p);
+    size_t len = (buf + 32) - cur;
+    std::memcpy(p, cur, len);
+    return p + len;
+}
+
+inline uint32_t skip_method(const char* p) {
+    char c = *p;
+    if (c == 'G' || c == 'P' && p[1] == 'U') return 4; // GET, PUT
+    if (c == 'P' && p[1] == 'O' || c == 'H') return 5; // POST, HEAD
+    if (c == 'P' && p[1] == 'A') return 6; // PATCH
+    if (c == 'D') return 7; // DELETE
+    if (c == 'O') return 8; // OPTIONS
+    while (*p != ' ') p++;
+    return 0; // fallback
 }
 
 } // namespace
@@ -184,19 +208,20 @@ int main(int argc, char* argv[]) {
     }
 
     std::vector<LocalDict> thread_dicts(num_threads);
-    std::vector<std::vector<std::vector<EpItem>>> thread_hour_items(num_threads);
-    for (auto& thi : thread_hour_items) {
-        thi.resize(72);
-        for (auto& h_vec : thi) h_vec.reserve(4500);
+    std::vector<std::vector<RawItem>> thread_items(num_threads);
+    for (unsigned int tid = 0; tid < num_threads; ++tid) {
+        size_t est_lines = (chunk_ends[tid] - chunk_starts[tid]) / 70;
+        thread_items[tid].reserve(est_lines + 8192);
     }
 
+    // 1. Parallel parse with fast method skip and fast 8-byte hash
     std::vector<std::thread> workers;
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
             const char* cur = data + chunk_starts[tid];
             const char* limit = data + chunk_ends[tid];
             auto& dict = thread_dicts[tid];
-            auto& my_hour_items = thread_hour_items[tid];
+            auto& my_items = thread_items[tid];
 
             while (cur < limit) {
                 const char* line_start = cur;
@@ -208,18 +233,22 @@ int main(int argc, char* argv[]) {
 
                 uint32_t hour_idx = parse_hour_idx(line_start);
 
-                // Skip method
+                // Fast Skip Method
                 const char* p = line_start + 28;
-                while (p < line_end && *p != ' ') p++;
-                if (p >= line_end) continue;
-                p++;
+                uint32_t m_skip = skip_method(p);
+                if (m_skip > 0) {
+                    p += m_skip;
+                } else {
+                    while (p < line_end && *p != ' ') p++;
+                    if (p < line_end) p++;
+                }
 
-                // Endpoint
+                // Fast Endpoint Scan via memchr
                 const char* ep_start = p;
-                while (p < line_end && *p != ' ') p++;
-                if (p >= line_end) continue;
-                uint32_t ep_len = (uint32_t)(p - ep_start);
-                p++;
+                const char* sp = static_cast<const char*>(std::memchr(p, ' ', line_end - p));
+                if (!sp) continue;
+                uint32_t ep_len = (uint32_t)(sp - ep_start);
+                p = sp + 1;
 
                 uint16_t ep_id = dict.get_or_insert(ep_start, ep_len);
 
@@ -228,19 +257,20 @@ int main(int argc, char* argv[]) {
                 uint8_t is_err = (p[0] == '5');
                 p += 4;
 
-                // Latency
+                // Latency (fast digit parse)
                 uint32_t latency = 0;
                 while (p < line_end && *p >= '0' && *p <= '9') {
                     latency = latency * 10 + (*p - '0');
                     p++;
                 }
 
-                my_hour_items[hour_idx].push_back({ep_id, latency, is_err});
+                my_items.push_back({(uint8_t)hour_idx, ep_id, is_err, latency});
             }
         });
     }
 
     for (auto& w : workers) w.join();
+    workers.clear();
 
     // 2. Build global unified endpoint dictionary
     std::vector<std::string_view> all_endpoints;
@@ -255,7 +285,7 @@ int main(int argc, char* argv[]) {
     std::vector<GlobalSlot> global_slots(4096);
 
     auto get_or_insert_global = [&](std::string_view sv) -> uint16_t {
-        uint64_t h64 = hash_bytes(sv.data(), sv.size());
+        uint64_t h64 = hash_bytes_fast(sv.data(), sv.size());
         uint32_t h = (uint32_t)(h64 ^ (h64 >> 32));
         if (h == 0) h = 1;
         size_t idx = h & GLOBAL_MASK;
@@ -298,82 +328,163 @@ int main(int argc, char* argv[]) {
         global_to_rank[sorted_order[rank]] = rank;
     }
 
-    // 4. Parallel Hour-Bucketed Grouping & Formatting across hardware threads
+    // Precompute combined remap lookup table: local_ep_id -> rank for each thread
+    std::vector<std::vector<uint16_t>> local_to_rank(num_threads);
+    for (unsigned int tid = 0; tid < num_threads; ++tid) {
+        local_to_rank[tid].resize(thread_dicts[tid].list.size());
+        for (size_t i = 0; i < thread_dicts[tid].list.size(); ++i) {
+            local_to_rank[tid][i] = global_to_rank[remap[tid][i]];
+        }
+    }
+
+    // 4. Counting Sort into Contiguous 12.4 MB Latency Array
+    size_t num_cells = 72 * (size_t)num_global_eps;
+
+    // Per-thread cell counts: thread_cell_counts[tid][cell_idx]
+    std::vector<std::vector<uint32_t>> thread_cell_counts(num_threads, std::vector<uint32_t>(num_cells, 0));
+    std::vector<std::vector<uint32_t>> thread_cell_errors(num_threads, std::vector<uint32_t>(num_cells, 0));
+
+    for (unsigned int tid = 0; tid < num_threads; ++tid) {
+        workers.emplace_back([&, tid]() {
+            auto& counts = thread_cell_counts[tid];
+            auto& errors = thread_cell_errors[tid];
+            const auto& l2r = local_to_rank[tid];
+            for (auto& item : thread_items[tid]) {
+                uint32_t rank = l2r[item.ep_id];
+                item.ep_id = (uint16_t)rank; // Cache rank directly in item!
+                uint32_t c = (uint32_t)item.hour_idx * num_global_eps + rank;
+                counts[c]++;
+                errors[c] += item.is_error;
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    workers.clear();
+
+    // Global cell offsets and totals
+    std::vector<uint32_t> cell_offsets(num_cells + 1, 0);
+    std::vector<uint32_t> cell_totals(num_cells, 0);
+    std::vector<uint32_t> cell_errors(num_cells, 0);
+
+    // Compute cell totals
+    for (size_t c = 0; c < num_cells; ++c) {
+        uint32_t tot = 0;
+        uint32_t err = 0;
+        for (unsigned int tid = 0; tid < num_threads; ++tid) {
+            tot += thread_cell_counts[tid][c];
+            err += thread_cell_errors[tid][c];
+        }
+        cell_totals[c] = tot;
+        cell_errors[c] = err;
+    }
+
+    // Prefix sums to find exact start offset of each cell in all_latencies
+    uint32_t current_offset = 0;
+    for (size_t c = 0; c < num_cells; ++c) {
+        cell_offsets[c] = current_offset;
+        current_offset += cell_totals[c];
+    }
+    cell_offsets[num_cells] = current_offset;
+    size_t total_items = current_offset;
+
+    // The Flat Contiguous 12.4 MB Latency Array (Resides in L3 Cache)
+    std::vector<uint32_t> all_latencies(total_items);
+
+    // Compute thread write offsets
+    std::vector<std::vector<uint32_t>> thread_write_offsets(num_threads, std::vector<uint32_t>(num_cells, 0));
+    for (size_t c = 0; c < num_cells; ++c) {
+        uint32_t base = cell_offsets[c];
+        for (unsigned int tid = 0; tid < num_threads; ++tid) {
+            thread_write_offsets[tid][c] = base;
+            base += thread_cell_counts[tid][c];
+        }
+    }
+
+    // Scatter latencies directly into flat array (using cached rank!)
+    for (unsigned int tid = 0; tid < num_threads; ++tid) {
+        workers.emplace_back([&, tid]() {
+            auto& cur_offs = thread_write_offsets[tid];
+            for (const auto& item : thread_items[tid]) {
+                uint32_t c = (uint32_t)item.hour_idx * num_global_eps + item.ep_id;
+                uint32_t dest = cur_offs[c]++;
+                all_latencies[dest] = item.latency;
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    workers.clear();
+
+    // Release thread raw items to free memory immediately
+    for (auto& ti : thread_items) std::vector<RawItem>().swap(ti);
+
+    // 5. Parallel Format & Percentiles by Hour
     std::vector<std::string> thread_output_strings(num_threads);
     uint32_t hours_per_thread = (72 + num_threads - 1) / num_threads;
 
-    struct Group {
-        std::vector<uint32_t> latencies;
-        uint32_t errors = 0;
-    };
-
-    std::vector<std::thread> format_workers;
     for (unsigned int h_tid = 0; h_tid < num_threads; ++h_tid) {
-        format_workers.emplace_back([&, h_tid]() {
+        workers.emplace_back([&, h_tid]() {
             uint32_t h_start = h_tid * hours_per_thread;
             uint32_t h_end = std::min(72u, h_start + hours_per_thread);
             if (h_start >= h_end) return;
 
-            std::vector<Group> local_groups(num_global_eps);
-
             std::string& out_str = thread_output_strings[h_tid];
             out_str.reserve(1024 * 1024);
+            char line_buf[256];
 
             for (uint32_t h = h_start; h < h_end; ++h) {
-                for (auto& g : local_groups) {
-                    g.latencies.clear();
-                    g.errors = 0;
-                }
-
-                for (unsigned int tid = 0; tid < num_threads; ++tid) {
-                    const auto& r = remap[tid];
-                    for (const auto& item : thread_hour_items[tid][h]) {
-                        uint16_t rank = global_to_rank[r[item.ep_id]];
-                        local_groups[rank].latencies.push_back(item.latency);
-                        local_groups[rank].errors += item.is_error;
-                    }
-                }
-
                 const std::string& hour_str = HOURS[h];
 
                 for (uint16_t rank = 0; rank < num_global_eps; ++rank) {
-                    auto& g = local_groups[rank];
-                    if (g.latencies.empty()) continue;
+                    size_t c = (size_t)h * num_global_eps + rank;
+                    uint32_t count = cell_totals[c];
+                    if (count == 0) continue;
 
-                    std::sort(g.latencies.begin(), g.latencies.end());
-                    size_t count = g.latencies.size();
-                    uint32_t p50 = nearest_rank_percentile(g.latencies, 50);
-                    uint32_t p95 = nearest_rank_percentile(g.latencies, 95);
-                    uint32_t p99 = nearest_rank_percentile(g.latencies, 99);
-                    uint64_t ppm = (static_cast<uint64_t>(g.errors) * 1000000ULL) / count;
+                    uint32_t off = cell_offsets[c];
+                    uint32_t* slice = all_latencies.data() + off;
+
+                    // Sort slice in-place directly in contiguous L3-resident memory
+                    std::sort(slice, slice + count);
+
+                    uint32_t p50 = nearest_rank_percentile_slice(slice, count, 50);
+                    uint32_t p95 = nearest_rank_percentile_slice(slice, count, 95);
+                    uint32_t p99 = nearest_rank_percentile_slice(slice, count, 99);
+                    uint32_t errs = cell_errors[c];
+                    uint64_t ppm = (static_cast<uint64_t>(errs) * 1000000ULL) / count;
 
                     std::string_view ep_sv = all_endpoints[sorted_order[rank]];
 
-                    out_str.append(hour_str);
-                    out_str.push_back(' ');
-                    out_str.append(ep_sv);
-                    out_str.push_back(' ');
+                    // Fast single-pass line formatting in L1 cache
+                    char* ptr = line_buf;
+                    std::memcpy(ptr, hour_str.data(), hour_str.size());
+                    ptr += hour_str.size();
+                    *ptr++ = ' ';
 
-                    fast_append_u64(out_str, count);
-                    out_str.push_back(' ');
-                    fast_append_u32(out_str, p50);
-                    out_str.push_back(' ');
-                    fast_append_u32(out_str, p95);
-                    out_str.push_back(' ');
-                    fast_append_u32(out_str, p99);
-                    out_str.push_back(' ');
-                    fast_append_u32(out_str, g.errors);
-                    out_str.push_back(' ');
-                    fast_append_u64(out_str, ppm);
-                    out_str.push_back('\n');
+                    std::memcpy(ptr, ep_sv.data(), ep_sv.size());
+                    ptr += ep_sv.size();
+                    *ptr++ = ' ';
+
+                    ptr = write_u64(ptr, count);
+                    *ptr++ = ' ';
+                    ptr = write_u32(ptr, p50);
+                    *ptr++ = ' ';
+                    ptr = write_u32(ptr, p95);
+                    *ptr++ = ' ';
+                    ptr = write_u32(ptr, p99);
+                    *ptr++ = ' ';
+                    ptr = write_u32(ptr, errs);
+                    *ptr++ = ' ';
+                    ptr = write_u64(ptr, ppm);
+                    *ptr++ = '\n';
+
+                    out_str.append(line_buf, ptr - line_buf);
                 }
             }
         });
     }
 
-    for (auto& w : format_workers) w.join();
+    for (auto& w : workers) w.join();
 
-    // 5. Emit output file
+    // 6. Emit output file
     #ifdef _WIN32
     CreateDirectoryA(out_dir.c_str(), NULL);
     #endif

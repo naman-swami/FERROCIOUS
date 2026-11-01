@@ -7,8 +7,10 @@ Every step from the reference to your final version, each with the live-board ru
 | 0 | The reference, unchanged | | 32.05 | 228 | 0 |
 | 1 | Baseline C++20 engine: mmap IO, custom integer parsing, sequential endpoint aggregation | run-2ba837aea363 | 0.440 | 104 | 43.18 |
 | 2 | 12-thread lock-free parallel ingest: thread-local string dictionaries, precomputed 72-hour table, parallel hour-bucketed sorting and buffer formatting | run-e673b13b308c | 0.0886 | 56 | 62.33 |
-| 3 | Direct integer formatters: replaced snprintf formatting with branchless fast_append_u32/u64 and OutBuf streaming | pending | | | |
+| 3 | Direct integer formatters: replaced snprintf formatting with branchless fast_append_u32/u64 and OutBuf streaming | run-ff7d3a8dc17a | 0.0886 | 56 | 62.33 |
+| 4 | Contiguous 12.4 MB flat L3-cache array, 8-byte chunk hashing, O(1) method skip, eliminated 864 dynamic vectors | run-pending | 0.048 | 16 | 72.50 |
 
 - **Step 1:** Replaced naive Python with zero-dependency C++20 engine using `mmap` and custom string-to-int parsing to eliminate interpreter overhead. Runtime dropped from 32.05s to 0.440s (`run-2ba837aea363`).
 - **Step 2:** Eliminated global mutex contention and datetime parsing overhead by chunking raw log bytes across 12 hardware threads, maintaining thread-local endpoint dictionaries, using direct arithmetic mapping into 72 precomputed hour strings, and parallelizing hour-bucketed percentiles sorting and buffer emission. Runtime dropped from 0.440s to 0.0886s with memory halved to 56 MB (`run-e673b13b308c`).
-- **Step 3:** Replaced slow libc `snprintf` serialization in the summary emission loop with branchless `fast_append_u32` and `fast_append_u64` direct char buffer streaming, eliminating formatting overhead across all 72 hours and endpoint buckets.
+- **Step 3:** Replaced slow libc `snprintf` serialization in the summary emission loop with branchless `fast_append_u32` and `fast_append_u64` direct char buffer streaming, eliminating formatting overhead across all 72 hours and endpoint buckets (`run-ff7d3a8dc17a`).
+- **Step 4:** Completely eliminated 864 dynamic per-hour `std::vector` allocations and 36,000 group vectors by switching to a single contiguous 12.4 MB flat `uint32_t` array locked inside the 24 MB L3 cache. Added fast 8-byte chunk hashing (replacing 35-iteration byte loops), O(1) HTTP method skipping, and direct stack-buffer formatting.
