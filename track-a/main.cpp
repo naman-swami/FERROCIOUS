@@ -1,6 +1,3 @@
-// FERROCIOUS Track A — 12-Thread Lock-Free Parallel Ingest Engine (specs/a-ingest.md)
-// Zero External Dependencies (D = 1.00). C++20.
-
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -10,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <thread>
+#include <chrono>
 #include "ferocious_common.hpp"
 
 namespace {
@@ -114,6 +112,34 @@ inline uint32_t nearest_rank_percentile(const std::vector<uint32_t>& sorted_vals
     size_t n = sorted_vals.size();
     size_t rank = (p * n + 99) / 100;
     return sorted_vals[rank - 1];
+}
+
+inline void fast_append_u32(std::string& s, uint32_t val) {
+    char buf[16];
+    char* p = buf + 16;
+    if (val == 0) {
+        s.push_back('0');
+        return;
+    }
+    while (val > 0) {
+        *--p = '0' + (val % 10);
+        val /= 10;
+    }
+    s.append(p, (buf + 16) - p);
+}
+
+inline void fast_append_u64(std::string& s, uint64_t val) {
+    char buf[32];
+    char* p = buf + 32;
+    if (val == 0) {
+        s.push_back('0');
+        return;
+    }
+    while (val > 0) {
+        *--p = '0' + (val % 10);
+        val /= 10;
+    }
+    s.append(p, (buf + 32) - p);
 }
 
 } // namespace
@@ -293,8 +319,6 @@ int main(int argc, char* argv[]) {
             std::string& out_str = thread_output_strings[h_tid];
             out_str.reserve(1024 * 1024);
 
-            char buf[64];
-
             for (uint32_t h = h_start; h < h_end; ++h) {
                 for (auto& g : local_groups) {
                     g.latencies.clear();
@@ -330,9 +354,18 @@ int main(int argc, char* argv[]) {
                     out_str.append(ep_sv);
                     out_str.push_back(' ');
 
-                    int len = snprintf(buf, sizeof(buf), "%zu %u %u %u %u %llu\n",
-                                       count, p50, p95, p99, g.errors, (unsigned long long)ppm);
-                    out_str.append(buf, len);
+                    fast_append_u64(out_str, count);
+                    out_str.push_back(' ');
+                    fast_append_u32(out_str, p50);
+                    out_str.push_back(' ');
+                    fast_append_u32(out_str, p95);
+                    out_str.push_back(' ');
+                    fast_append_u32(out_str, p99);
+                    out_str.push_back(' ');
+                    fast_append_u32(out_str, g.errors);
+                    out_str.push_back(' ');
+                    fast_append_u64(out_str, ppm);
+                    out_str.push_back('\n');
                 }
             }
         });
@@ -348,9 +381,11 @@ int main(int argc, char* argv[]) {
     FILE* fp = fopen(output_path.c_str(), "wb");
     if (!fp) return 1;
 
+    ferocious::OutBuf out(fp);
     for (unsigned int h_tid = 0; h_tid < num_threads; ++h_tid) {
-        fwrite(thread_output_strings[h_tid].data(), 1, thread_output_strings[h_tid].size(), fp);
+        out.puts(thread_output_strings[h_tid].data(), thread_output_strings[h_tid].size());
     }
+    out.flush();
     fclose(fp);
     return 0;
 }
