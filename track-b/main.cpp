@@ -1,4 +1,4 @@
-// FERROCIOUS Track B — Ultra-Fast Flat Hash Inverted Index Engine
+// FERROCIOUS Track B — Ultra-Fast SIMD Chunked Flat Hash Inverted Index Engine
 // Zero External Dependencies (D = 1.00). C++20.
 
 #include <iostream>
@@ -12,6 +12,9 @@
 #include <cstdint>
 #include <thread>
 #include <array>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 #include "ferocious_common.hpp"
 
 namespace {
@@ -68,6 +71,25 @@ inline void append_u64(std::string& s, uint64_t v) {
         v /= 10;
     }
     s.append(p, buf + sizeof(buf) - p);
+}
+
+// Fast SIMD newline counting
+inline size_t count_newlines_simd(const char* data, size_t size) {
+    size_t count = 0;
+    size_t i = 0;
+#if defined(__AVX2__)
+    __m256i nl = _mm256_set1_epi8('\n');
+    for (; i + 32 <= size; i += 32) {
+        __m256i block = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(data + i));
+        __m256i cmp = _mm256_cmpeq_epi8(block, nl);
+        unsigned mask = _mm256_movemask_epi8(cmp);
+        count += _mm_popcnt_u32(mask);
+    }
+#endif
+    for (; i < size; ++i) {
+        if (data[i] == '\n') count++;
+    }
+    return count;
 }
 
 } // namespace
@@ -170,34 +192,43 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 2. Pre-scan docs to find doc boundaries
+    // 2. Parallel SIMD chunk partition of docs.txt
+    std::vector<const char*> chunk_starts(num_threads);
+    std::vector<const char*> chunk_ends(num_threads);
+    size_t chunk_bytes = docs_size / num_threads;
+
+    for (unsigned tid = 0; tid < num_threads; ++tid) {
+        const char* s = docs_data + tid * chunk_bytes;
+        const char* e = (tid == num_threads - 1) ? docs_data + docs_size : docs_data + (tid + 1) * chunk_bytes;
+        if (tid > 0) { while (s < docs_data + docs_size && *s != '\n') s++; if (s < docs_data + docs_size) s++; }
+        if (tid < num_threads - 1) { while (e < docs_data + docs_size && *e != '\n') e++; if (e < docs_data + docs_size) e++; }
+        chunk_starts[tid] = s;
+        chunk_ends[tid] = e;
+    }
+
+    std::vector<size_t> thread_doc_counts(num_threads, 0);
+    std::vector<std::thread> workers;
+    for (unsigned tid = 0; tid < num_threads; ++tid) {
+        workers.emplace_back([&, tid]() {
+            if (chunk_starts[tid] < chunk_ends[tid]) {
+                thread_doc_counts[tid] = count_newlines_simd(chunk_starts[tid], chunk_ends[tid] - chunk_starts[tid]);
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    workers.clear();
+
+    std::vector<uint32_t> thread_start_doc_id(num_threads, 0);
+    for (unsigned tid = 1; tid < num_threads; ++tid) {
+        thread_start_doc_id[tid] = thread_start_doc_id[tid - 1] + thread_doc_counts[tid - 1];
+    }
+    size_t total_docs = thread_start_doc_id.back() + thread_doc_counts.back();
+
     struct DocSpan {
         const char* start = nullptr;
         const char* end = nullptr;
     };
-    std::vector<DocSpan> doc_spans;
-    doc_spans.reserve(300000);
-
-    {
-        const char* cur = docs_data;
-        const char* docs_end = docs_data + docs_size;
-        while (cur < docs_end) {
-            const char* line_end = static_cast<const char*>(std::memchr(cur, '\n', docs_end - cur));
-            if (!line_end) line_end = docs_end;
-            const char* next_cur = (line_end < docs_end) ? line_end + 1 : docs_end;
-            while (line_end > cur && (line_end[-1] == '\r' || line_end[-1] == ' ' || line_end[-1] == '\t')) line_end--;
-
-            const char* tab_pos = static_cast<const char*>(std::memchr(cur, '\t', line_end - cur));
-            if (tab_pos) {
-                doc_spans.push_back({tab_pos + 1, line_end});
-            } else {
-                doc_spans.push_back({cur, cur});
-            }
-            cur = next_cur;
-        }
-    }
-
-    size_t total_docs = doc_spans.size();
+    std::vector<DocSpan> doc_spans(total_docs);
 
     // 3. Ultra-Fast Parallel Register-Hashing Tokenization across 12 threads
     std::vector<std::vector<std::vector<uint32_t>>> thread_indexes(num_threads);
@@ -205,37 +236,41 @@ int main(int argc, char* argv[]) {
         thread_indexes[tid].resize(num_active_tokens);
     }
 
-    size_t docs_per_thread = (total_docs + num_threads - 1) / num_threads;
-    std::vector<std::thread> index_workers;
-    index_workers.reserve(num_threads);
-
     for (unsigned tid = 0; tid < num_threads; ++tid) {
-        index_workers.emplace_back([&, tid]() {
-            size_t start_id = tid * docs_per_thread;
-            size_t end_id = std::min(total_docs, start_id + docs_per_thread);
-            if (start_id >= end_id) return;
-
+        workers.emplace_back([&, tid]() {
+            const char* cur = chunk_starts[tid];
+            const char* limit = chunk_ends[tid];
+            uint32_t cur_doc_id = thread_start_doc_id[tid];
             auto& local_index = thread_indexes[tid];
             std::vector<uint32_t> doc_active_ids;
             doc_active_ids.reserve(64);
 
-            for (size_t doc_id = start_id; doc_id < end_id; ++doc_id) {
-                const auto& span = doc_spans[doc_id];
-                const char* p = span.start;
-                const char* text_end = span.end;
+            while (cur < limit) {
+                const char* line_end = static_cast<const char*>(std::memchr(cur, '\n', limit - cur));
+                if (!line_end) line_end = limit;
+                const char* next_cur = (line_end < limit) ? line_end + 1 : limit;
+                const char* text_end = line_end;
+                while (text_end > cur && (text_end[-1] == '\r' || text_end[-1] == ' ' || text_end[-1] == '\t')) text_end--;
+
+                const char* tab_pos = (text_end > cur) ? static_cast<const char*>(std::memchr(cur, '\t', text_end - cur)) : nullptr;
+                const char* text_start = tab_pos ? tab_pos + 1 : cur;
+                doc_spans[cur_doc_id] = {text_start, text_end};
 
                 doc_active_ids.clear();
-                while (p < text_end) {
-                    while (p < text_end && TOKEN_CHAR[(uint8_t)*p] == 0) p++;
-                    if (p >= text_end) break;
+                const char* dp = text_start;
+                const char* dend = text_end;
 
+                while (dp < dend) {
+                    while (dp < dend && TOKEN_CHAR[(uint8_t)*dp] == 0) dp++;
+                    if (dp >= dend) break;
                     uint64_t h = 0xcbf29ce484222325ULL;
-                    while (p < text_end && TOKEN_CHAR[(uint8_t)*p] != 0) {
-                        h = (h ^ TOKEN_CHAR[(uint8_t)*p]) * 0x100000001b3ULL;
-                        p++;
+                    while (dp < dend) {
+                        uint8_t tc = TOKEN_CHAR[(uint8_t)*dp];
+                        if (tc == 0) break;
+                        h = (h ^ tc) * 0x100000001b3ULL;
+                        dp++;
                     }
                     if (h == 0) h = 1;
-
                     size_t slot = h & VOCAB_MASK;
                     while (vocab_table[slot].hash != 0) {
                         if (vocab_table[slot].hash == h) {
@@ -248,44 +283,53 @@ int main(int argc, char* argv[]) {
 
                 if (!doc_active_ids.empty()) {
                     std::sort(doc_active_ids.begin(), doc_active_ids.end());
-                    doc_active_ids.erase(std::unique(doc_active_ids.begin(), doc_active_ids.end()), doc_active_ids.end());
-
+                    uint32_t prev = UINT32_MAX;
                     for (uint32_t tok_id : doc_active_ids) {
-                        local_index[tok_id].push_back(static_cast<uint32_t>(doc_id));
+                        if (tok_id != prev) {
+                            local_index[tok_id].push_back(cur_doc_id);
+                            prev = tok_id;
+                        }
                     }
+                }
+
+                cur_doc_id++;
+                cur = next_cur;
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    workers.clear();
+
+    // 4. 12-thread Parallel Index Merge
+    std::vector<std::vector<uint32_t>> global_index(num_active_tokens);
+    size_t tokens_per_thread = (num_active_tokens + num_threads - 1) / num_threads;
+
+    for (unsigned tid = 0; tid < num_threads; ++tid) {
+        workers.emplace_back([&, tid]() {
+            size_t tok_start = tid * tokens_per_thread;
+            size_t tok_end = std::min((size_t)num_active_tokens, tok_start + tokens_per_thread);
+            for (size_t tok_id = tok_start; tok_id < tok_end; ++tok_id) {
+                size_t total_p = 0;
+                for (unsigned t = 0; t < num_threads; ++t) total_p += thread_indexes[t][tok_id].size();
+                global_index[tok_id].reserve(total_p);
+                for (unsigned t = 0; t < num_threads; ++t) {
+                    const auto& pt = thread_indexes[t][tok_id];
+                    global_index[tok_id].insert(global_index[tok_id].end(), pt.begin(), pt.end());
                 }
             }
         });
     }
-
-    for (auto& w : index_workers) w.join();
-
-    // 4. Merge thread posting lists into global inverted index
-    std::vector<std::vector<uint32_t>> global_index(num_active_tokens);
-    for (uint32_t tok_id = 0; tok_id < num_active_tokens; ++tok_id) {
-        size_t total_p = 0;
-        for (unsigned tid = 0; tid < num_threads; ++tid) {
-            total_p += thread_indexes[tid][tok_id].size();
-        }
-        global_index[tok_id].reserve(total_p);
-        for (unsigned tid = 0; tid < num_threads; ++tid) {
-            const auto& pt = thread_indexes[tid][tok_id];
-            global_index[tok_id].insert(global_index[tok_id].end(), pt.begin(), pt.end());
-        }
-    }
+    for (auto& w : workers) w.join();
+    workers.clear();
     thread_indexes.clear();
-    thread_indexes.shrink_to_fit();
 
     // 5. Parallel Query Execution across 12 hardware threads
     size_t total_queries = query_lines.size();
     std::vector<std::string> thread_outputs(num_threads);
-    std::vector<std::thread> query_workers;
-    query_workers.reserve(num_threads);
-
     size_t q_chunk = (total_queries + num_threads - 1) / num_threads;
 
     for (unsigned tid = 0; tid < num_threads; ++tid) {
-        query_workers.emplace_back([&, tid]() {
+        workers.emplace_back([&, tid]() {
             size_t q_start = tid * q_chunk;
             size_t q_end = std::min(total_queries, q_start + q_chunk);
             if (q_start >= q_end) return;
@@ -294,10 +338,15 @@ int main(int argc, char* argv[]) {
             out_str.reserve((q_end - q_start) * 32);
 
             std::vector<char> phrase_buf;
+            phrase_buf.reserve(4096);
+            std::vector<std::string_view> doc_toks;
+            doc_toks.reserve(512);
             std::vector<uint32_t> buf_a;
             std::vector<uint32_t> buf_b;
             buf_a.reserve(32768);
             buf_b.reserve(32768);
+            std::vector<uint32_t> matches;
+            matches.reserve(4096);
 
             for (size_t qi = q_start; qi < q_end; ++qi) {
                 const auto& qline = query_lines[qi];
@@ -427,7 +476,7 @@ int main(int argc, char* argv[]) {
                     }
 
                     size_t k = phrase_terms.size();
-                    std::vector<uint32_t> matches;
+                    matches.clear();
 
                     for (uint32_t doc_id : *cur_cand) {
                         if (doc_id >= doc_spans.size()) continue;
@@ -438,7 +487,7 @@ int main(int argc, char* argv[]) {
                         phrase_buf.resize(doc_len);
                         char* buf_p = phrase_buf.data();
 
-                        std::vector<std::string_view> doc_toks;
+                        doc_toks.clear();
                         const char* p = span.start;
                         while (p < span.end) {
                             while (p < span.end && TOKEN_CHAR[(uint8_t)*p] == 0) p++;
@@ -449,27 +498,22 @@ int main(int argc, char* argv[]) {
                                 buf_p[p - span.start] = (char)TOKEN_CHAR[(uint8_t)*p];
                                 p++;
                             }
-                            doc_toks.emplace_back(buf_p + off, p - tok_s);
+                            doc_toks.emplace_back(buf_p + off, (p - span.start) - off);
                         }
 
                         if (doc_toks.size() < k) continue;
-
-                        bool matched = false;
                         for (size_t i = 0; i + k <= doc_toks.size(); ++i) {
-                            bool seq_ok = true;
+                            bool match = true;
                             for (size_t j = 0; j < k; ++j) {
                                 if (doc_toks[i + j] != phrase_terms[j]) {
-                                    seq_ok = false;
+                                    match = false;
                                     break;
                                 }
                             }
-                            if (seq_ok) {
-                                matched = true;
+                            if (match) {
+                                matches.push_back(doc_id);
                                 break;
                             }
-                        }
-                        if (matched) {
-                            matches.push_back(doc_id);
                         }
                     }
 
@@ -482,9 +526,9 @@ int main(int argc, char* argv[]) {
                     append_u64(out_str, sum_ids);
 
                     size_t top_m = std::min(count, size_t(10));
-                    for (size_t i = 0; i < top_m; ++i) {
+                    for (size_t m_i = 0; m_i < top_m; ++m_i) {
                         out_str.push_back(' ');
-                        append_u32(out_str, matches[i]);
+                        append_u32(out_str, matches[m_i]);
                     }
                     out_str.push_back('\n');
                 }
@@ -492,9 +536,9 @@ int main(int argc, char* argv[]) {
         });
     }
 
-    for (auto& w : query_workers) w.join();
+    for (auto& w : workers) w.join();
 
-    // 6. Output writing
+    // 6. Write results.txt
     #ifdef _WIN32
     CreateDirectoryA(out_dir.c_str(), NULL);
     #endif
@@ -502,10 +546,8 @@ int main(int argc, char* argv[]) {
     FILE* fp = fopen(results_path.c_str(), "wb");
     if (!fp) return 1;
 
-    for (unsigned tid = 0; tid < num_threads; ++tid) {
-        if (!thread_outputs[tid].empty()) {
-            fwrite(thread_outputs[tid].data(), 1, thread_outputs[tid].size(), fp);
-        }
+    for (const auto& s : thread_outputs) {
+        fwrite(s.data(), 1, s.size(), fp);
     }
     fclose(fp);
 

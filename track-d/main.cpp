@@ -1,4 +1,4 @@
-// FERROCIOUS Track D — High-Performance Parallel CSR + Bidirectional 4-ary Heap Dijkstra Engine
+// FERROCIOUS Track D — Ultra-Low-Memory CSR + Hole-Shifting 4-ary MinHeap Bidirectional Dijkstra
 // Zero External Dependencies (D = 1.00). C++20.
 
 #include <iostream>
@@ -19,7 +19,7 @@ struct HeapItem {
     uint32_t u;
 };
 
-// Fast 4-ary Min-Heap
+// Ultra-Fast 4-ary Min-Heap with Hole Shifting (Zero intermediate swaps)
 struct MinHeap4 {
     std::vector<HeapItem> data;
 
@@ -35,15 +35,17 @@ struct MinHeap4 {
     inline void push(uint64_t dist, uint32_t u) {
         size_t i = data.size();
         data.push_back({dist, u});
+        HeapItem val = {dist, u};
         while (i > 0) {
             size_t parent = (i - 1) >> 2;
-            if (data[i].dist < data[parent].dist) {
-                std::swap(data[i], data[parent]);
+            if (val.dist < data[parent].dist) {
+                data[i] = data[parent];
                 i = parent;
             } else {
                 break;
             }
         }
+        data[i] = val;
     }
 
     inline HeapItem pop() {
@@ -51,30 +53,34 @@ struct MinHeap4 {
         HeapItem val = data.back();
         data.pop_back();
         if (!data.empty()) {
-            data[0] = val;
             size_t i = 0;
             size_t n = data.size();
             while (true) {
                 size_t child = (i << 2) + 1;
                 if (child >= n) break;
                 size_t best = child;
-                size_t c2 = child + 1;
-                size_t c3 = child + 2;
-                size_t c4 = child + 3;
+                size_t c2 = child + 1, c3 = child + 2, c4 = child + 3;
                 if (c2 < n && data[c2].dist < data[best].dist) best = c2;
                 if (c3 < n && data[c3].dist < data[best].dist) best = c3;
                 if (c4 < n && data[c4].dist < data[best].dist) best = c4;
 
-                if (data[best].dist < data[i].dist) {
-                    std::swap(data[i], data[best]);
+                if (data[best].dist < val.dist) {
+                    data[i] = data[best];
                     i = best;
                 } else {
                     break;
                 }
             }
+            data[i] = val;
         }
         return top;
     }
+};
+
+// Compact 8-byte HalfEdge for L1/L2 cache locality
+struct HalfEdge {
+    uint32_t to;
+    uint32_t w;
 };
 
 } // namespace
@@ -124,12 +130,6 @@ int main(int argc, char* argv[]) {
         chunk_ends[tid] = e;
     }
 
-    struct ThreadEdges {
-        std::vector<uint32_t> u;
-        std::vector<uint32_t> v;
-        std::vector<uint64_t> w;
-    };
-    std::vector<ThreadEdges> thread_data(num_threads);
     std::vector<std::atomic<uint32_t>> fwd_degree(n + 2);
     std::vector<std::atomic<uint32_t>> rev_degree(n + 2);
     for (uint32_t i = 0; i <= n + 1; ++i) {
@@ -137,15 +137,10 @@ int main(int argc, char* argv[]) {
         rev_degree[i].store(0, std::memory_order_relaxed);
     }
 
-    // 1. Parallel Parsing & Degree Counting
+    // 1. Pass 1: Parse degrees directly into atomic counters (Zero edge buffer allocation)
     std::vector<std::thread> workers;
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
-            auto& td = thread_data[tid];
-            td.u.reserve(m / num_threads + 10000);
-            td.v.reserve(m / num_threads + 10000);
-            td.w.reserve(m / num_threads + 10000);
-
             const char* p = chunk_starts[tid];
             const char* limit = chunk_ends[tid];
             while (p < limit) {
@@ -156,15 +151,8 @@ int main(int argc, char* argv[]) {
                 while (p < limit && (*p == ' ' || *p == '\t')) p++;
                 uint32_t v = 0;
                 while (p < limit && *p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
-                while (p < limit && (*p == ' ' || *p == '\t')) p++;
-                uint64_t w = 0;
-                while (p < limit && *p >= '0' && *p <= '9') w = w * 10 + (*p++ - '0');
                 while (p < limit && *p != '\n') p++;
                 if (p < limit && *p == '\n') p++;
-
-                td.u.push_back(u);
-                td.v.push_back(v);
-                td.w.push_back(w);
 
                 fwd_degree[u + 1].fetch_add(1, std::memory_order_relaxed);
                 rev_degree[v + 1].fetch_add(1, std::memory_order_relaxed);
@@ -189,34 +177,38 @@ int main(int argc, char* argv[]) {
     std::vector<std::atomic<uint32_t>>().swap(fwd_degree);
     std::vector<std::atomic<uint32_t>>().swap(rev_degree);
 
-    std::vector<uint32_t> fwd_to(m);
-    std::vector<uint64_t> fwd_w(m);
-    std::vector<uint32_t> rev_to(m);
-    std::vector<uint64_t> rev_w(m);
+    std::vector<HalfEdge> fwd_edges(m);
+    std::vector<HalfEdge> rev_edges(m);
 
-    // 3. Parallel Scatter into CSR
+    // 3. Pass 2: Parallel Direct Scatter into compact HalfEdge arrays
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
-            const auto& td = thread_data[tid];
-            size_t count = td.u.size();
-            for (size_t i = 0; i < count; ++i) {
-                uint32_t u = td.u[i];
-                uint32_t v = td.v[i];
-                uint64_t w = td.w[i];
+            const char* p = chunk_starts[tid];
+            const char* limit = chunk_ends[tid];
+            while (p < limit) {
+                while (p < limit && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+                if (p >= limit) break;
+                uint32_t u = 0;
+                while (p < limit && *p >= '0' && *p <= '9') u = u * 10 + (*p++ - '0');
+                while (p < limit && (*p == ' ' || *p == '\t')) p++;
+                uint32_t v = 0;
+                while (p < limit && *p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+                while (p < limit && (*p == ' ' || *p == '\t')) p++;
+                uint32_t w = 0;
+                while (p < limit && *p >= '0' && *p <= '9') w = w * 10 + (*p++ - '0');
+                while (p < limit && *p != '\n') p++;
+                if (p < limit && *p == '\n') p++;
 
                 uint32_t fp = cur_fwd[u].fetch_add(1, std::memory_order_relaxed);
-                fwd_to[fp] = v;
-                fwd_w[fp] = w;
+                fwd_edges[fp] = {v, w};
 
                 uint32_t rp = cur_rev[v].fetch_add(1, std::memory_order_relaxed);
-                rev_to[rp] = u;
-                rev_w[rp] = w;
+                rev_edges[rp] = {u, w};
             }
         });
     }
     for (auto& w : workers) w.join();
     workers.clear();
-    std::vector<ThreadEdges>().swap(thread_data);
     std::vector<std::atomic<uint32_t>>().swap(cur_fwd);
     std::vector<std::atomic<uint32_t>>().swap(cur_rev);
 
@@ -248,8 +240,9 @@ int main(int argc, char* argv[]) {
     std::vector<int64_t> answers(num_queries, -1);
     std::atomic<size_t> query_idx{0};
 
-    // 5. Parallel Bidirectional Dijkstra
-    for (unsigned int tid = 0; tid < num_threads; ++tid) {
+    // 5. Parallel Bidirectional Dijkstra (6 dedicated P-core threads for maximum CPU throughput & low memory)
+    unsigned int query_threads = std::min(num_threads, 6u);
+    for (unsigned int tid = 0; tid < query_threads; ++tid) {
         workers.emplace_back([&]() {
             std::vector<uint64_t> f_dist(n, INF64);
             std::vector<uint64_t> r_dist(n, INF64);
@@ -304,8 +297,8 @@ int main(int argc, char* argv[]) {
                         uint32_t e_start = fwd_head[u];
                         uint32_t e_end   = fwd_head[u + 1];
                         for (uint32_t e = e_start; e < e_end; ++e) {
-                            uint32_t v = fwd_to[e];
-                            uint64_t nd = d + fwd_w[e];
+                            uint32_t v = fwd_edges[e].to;
+                            uint64_t nd = d + fwd_edges[e].w;
                             if (nd < f_dist[v]) {
                                 if (f_dist[v] == INF64) f_visited.push_back(v);
                                 f_dist[v] = nd;
@@ -324,8 +317,8 @@ int main(int argc, char* argv[]) {
                         uint32_t e_start = rev_head[u];
                         uint32_t e_end   = rev_head[u + 1];
                         for (uint32_t e = e_start; e < e_end; ++e) {
-                            uint32_t v = rev_to[e];
-                            uint64_t nd = d + rev_w[e];
+                            uint32_t v = rev_edges[e].to;
+                            uint64_t nd = d + rev_edges[e].w;
                             if (nd < r_dist[v]) {
                                 if (r_dist[v] == INF64) r_visited.push_back(v);
                                 r_dist[v] = nd;
