@@ -5,14 +5,18 @@
 #include <string_view>
 #include <cstring>
 #include <cstdint>
-#include <map>
 #include <algorithm>
 #include <thread>
 #include <atomic>
 #include <mutex>
 #include <bit>
 #include <memory>
+#include <chrono>
 #include "ferocious_common.hpp"
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 namespace {
 
@@ -39,39 +43,50 @@ inline void format_cents(int64_t cents, ferocious::OutBuf& out) {
     out.put('0' + (rem % 10));
 }
 
-inline int64_t parse_cents_strict(const char* p, const char* end) {
+inline int64_t parse_cents_fast(const char*& p, const char* end) {
     bool neg = false;
     if (p < end && *p == '-') {
         neg = true;
         p++;
     }
     int64_t whole = 0;
-    while (p < end && *p >= '0' && *p <= '9') {
+    while (p < end && static_cast<unsigned char>(*p - '0') <= 9) {
         whole = whole * 10 + (*p - '0');
         p++;
     }
     int64_t frac = 0;
     if (p < end && *p == '.') {
         p++;
-        if (p < end && *p >= '0' && *p <= '9') frac = (p[0] - '0') * 10;
-        if (p + 1 < end && *(p + 1) >= '0' && *(p + 1) <= '9') frac += (p[1] - '0');
+        if (p < end && static_cast<unsigned char>(*p - '0') <= 9) {
+            frac = (*p - '0') * 10;
+            p++;
+        }
+        if (p < end && static_cast<unsigned char>(*p - '0') <= 9) {
+            frac += (*p - '0');
+            p++;
+        }
     }
     int64_t total = whole * 100 + frac;
     return neg ? -total : total;
 }
 
-inline uint64_t hash_bytes(const char* p, size_t len) {
-    uint64_t h = 0xcbf29ce484222325ULL;
-    for (size_t i = 0; i < len; ++i) {
-        h ^= (uint8_t)p[i];
-        h *= 0x100000001b3ULL;
+// 8-byte fast hash
+inline uint64_t hash_bytes_fast(const char* p, size_t len) {
+    uint64_t h = len * 0x517cc1b727220a95ULL;
+    while (len >= 8) {
+        uint64_t v;
+        std::memcpy(&v, p, 8);
+        h = (h ^ v) * 0x517cc1b727220a95ULL;
+        p += 8;
+        len -= 8;
+    }
+    if (len > 0) {
+        uint64_t v = 0;
+        std::memcpy(&v, p, len);
+        h = (h ^ v) * 0x517cc1b727220a95ULL;
     }
     return h;
 }
-
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
-#endif
 
 static constexpr size_t POOL_CAP = 262144;
 static constexpr size_t POOL_MASK = POOL_CAP - 1;
@@ -79,6 +94,7 @@ static constexpr size_t POOL_MASK = POOL_CAP - 1;
 struct PoolSlot {
     std::atomic<uint32_t> state{0}; // 0 = empty, 1 = reserving, 2 = ready
     uint64_t hash = 0;
+    uint64_t prefix = 0;
     uint32_t offset = 0;
     uint32_t len = 0;
     uint32_t name_id = 0;
@@ -89,9 +105,16 @@ static char pool_arena[2 * 1024 * 1024]; // 2 MB fixed arena
 static std::atomic<uint32_t> pool_arena_size{0};
 static std::atomic<uint32_t> pool_next_id{0};
 
-inline uint32_t get_or_register_name(const char* s, size_t len) {
-    uint64_t h = hash_bytes(s, len);
+inline uint32_t get_or_register_name_fast(const char* s, size_t len) {
+    uint64_t h = hash_bytes_fast(s, len);
     if (h == 0) h = 1;
+
+    uint64_t prefix = 0;
+    if (len >= 8) {
+        std::memcpy(&prefix, s, 8);
+    } else if (len > 0) {
+        std::memcpy(&prefix, s, len);
+    }
 
     size_t idx = h & POOL_MASK;
     while (true) {
@@ -106,6 +129,7 @@ inline uint32_t get_or_register_name(const char* s, size_t len) {
                 pool_table[idx].len = (uint32_t)len;
                 pool_table[idx].name_id = nid;
                 pool_table[idx].hash = h;
+                pool_table[idx].prefix = prefix;
                 pool_table[idx].state.store(2, std::memory_order_release);
                 return nid;
             }
@@ -119,9 +143,10 @@ inline uint32_t get_or_register_name(const char* s, size_t len) {
             st = pool_table[idx].state.load(std::memory_order_acquire);
         }
 
-        if (st == 2 && pool_table[idx].hash == h && pool_table[idx].len == len &&
-            std::memcmp(pool_arena + pool_table[idx].offset, s, len) == 0) {
-            return pool_table[idx].name_id;
+        if (st == 2 && pool_table[idx].hash == h && pool_table[idx].prefix == prefix && pool_table[idx].len == len) {
+            if (len <= 8 || std::memcmp(pool_arena + pool_table[idx].offset + 8, s + 8, len - 8) == 0) {
+                return pool_table[idx].name_id;
+            }
         }
 
         idx = (idx + 1) & POOL_MASK;
@@ -140,28 +165,41 @@ struct ThreadStats {
 
 static constexpr size_t BITSET_WORDS = 2048;
 
-struct FastCountryMap {
+struct ThreadSafeCountryMap {
     struct Slot {
-        uint32_t code = 0;
+        std::atomic<uint32_t> code{0};
         uint16_t cid = 0xFFFF;
     };
     Slot table[1024];
+    std::mutex mtx;
 
-    FastCountryMap() {
-        std::memset(table, 0, sizeof(table));
+    ThreadSafeCountryMap() {
+        for (size_t i = 0; i < 1024; ++i) {
+            table[i].code.store(0, std::memory_order_relaxed);
+            table[i].cid = 0xFFFF;
+        }
     }
 
     uint16_t get_or_insert(uint32_t code, const char* str_ptr, size_t clen, std::vector<std::string>& country_names) {
         size_t idx = (code * 0x9E3779B9u) & 1023;
-        while (table[idx].code != 0) {
-            if (table[idx].code == code) return table[idx].cid;
+        while (true) {
+            uint32_t c = table[idx].code.load(std::memory_order_acquire);
+            if (c == code) return table[idx].cid;
+            if (c == 0) {
+                std::lock_guard<std::mutex> lock(mtx);
+                // Double check under lock
+                c = table[idx].code.load(std::memory_order_relaxed);
+                if (c == code) return table[idx].cid;
+                if (c == 0) {
+                    uint16_t cid = (uint16_t)country_names.size();
+                    country_names.push_back(std::string(str_ptr, clen));
+                    table[idx].cid = cid;
+                    table[idx].code.store(code, std::memory_order_release);
+                    return cid;
+                }
+            }
             idx = (idx + 1) & 1023;
         }
-        table[idx].code = code;
-        uint16_t cid = (uint16_t)country_names.size();
-        table[idx].cid = cid;
-        country_names.push_back(std::string(str_ptr, clen));
-        return cid;
     }
 };
 
@@ -180,49 +218,77 @@ int main(int argc, char* argv[]) {
     std::string records_path = data_dir + "/records.csv";
     std::string aggregates_path = out_dir + "/aggregates.txt";
 
-    get_or_register_name("", 0);
+    get_or_register_name_fast("", 0);
 
-    // 1. Ingest regions.csv with FastCountryMap and 1M array
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 6;
+    if (num_threads > 12) num_threads = 12;
+
+    // 1. Parallel Ingest of regions.csv across 12 threads
     std::memset(region_to_country, 0xFF, sizeof(region_to_country));
     std::vector<std::string> country_names;
-    FastCountryMap cmap;
+    country_names.reserve(300);
+    ThreadSafeCountryMap cmap;
     uint16_t unmatched_cid = 0xFFFF;
 
     {
         ferocious::MappedFile rmf(regions_path.c_str());
         if (!rmf.ok) return 1;
 
-        const char* p = static_cast<const char*>(rmf.data);
-        const char* end = p + rmf.size;
+        const char* r_data = static_cast<const char*>(rmf.data);
+        size_t r_size = rmf.size;
 
-        const char* nl = static_cast<const char*>(std::memchr(p, '\n', end - p));
-        if (nl) p = nl + 1;
+        const char* r_hdr = static_cast<const char*>(std::memchr(r_data, '\n', r_size));
+        size_t r_start = r_hdr ? (r_hdr - r_data + 1) : 0;
 
-        while (p < end) {
-            if (*p == '\r' || *p == '\n') { p++; continue; }
-            uint32_t rid = 0;
-            while (p < end && *p >= '0' && *p <= '9') {
-                rid = rid * 10 + (*p - '0');
-                p++;
-            }
-            if (p < end && *p == ',') p++;
-            const char* cstart = p;
-            while (p < end && *p != '\r' && *p != '\n') p++;
-            size_t clen = p - cstart;
+        size_t r_chunk_bytes = (r_size - r_start) / num_threads;
 
-            uint32_t code = 0;
-            if (clen == 3) {
-                code = (uint8_t)cstart[0] | ((uint8_t)cstart[1] << 8) | ((uint8_t)cstart[2] << 16);
-            } else {
-                for (size_t i = 0; i < clen && i < 4; ++i) code |= ((uint8_t)cstart[i] << (i * 8));
-            }
+        std::vector<std::thread> r_workers;
+        for (unsigned int tid = 0; tid < num_threads; ++tid) {
+            r_workers.emplace_back([&, tid]() {
+                size_t start = r_start + tid * r_chunk_bytes;
+                size_t end = (tid == num_threads - 1) ? r_size : r_start + (tid + 1) * r_chunk_bytes;
 
-            uint16_t cid = cmap.get_or_insert(code, cstart, clen, country_names);
-            if (rid < 1000000) region_to_country[rid] = cid;
+                if (tid > 0) {
+                    while (start < r_size && r_data[start] != '\n') start++;
+                    if (start < r_size) start++;
+                }
+                if (tid < num_threads - 1) {
+                    while (end < r_size && r_data[end] != '\n') end++;
+                    if (end < r_size) end++;
+                }
 
-            if (p < end && *p == '\r') p++;
-            if (p < end && *p == '\n') p++;
+                const char* p = r_data + start;
+                const char* limit = r_data + end;
+
+                while (p < limit) {
+                    if (*p == '\r' || *p == '\n') { p++; continue; }
+                    uint32_t rid = 0;
+                    while (p < limit && static_cast<unsigned char>(*p - '0') <= 9) {
+                        rid = rid * 10 + (*p - '0');
+                        p++;
+                    }
+                    if (p < limit && *p == ',') p++;
+                    const char* cstart = p;
+                    while (p < limit && *p != '\r' && *p != '\n') p++;
+                    size_t clen = p - cstart;
+
+                    uint32_t code = 0;
+                    if (clen == 3) {
+                        code = (uint8_t)cstart[0] | ((uint8_t)cstart[1] << 8) | ((uint8_t)cstart[2] << 16);
+                    } else {
+                        for (size_t i = 0; i < clen && i < 4; ++i) code |= ((uint8_t)cstart[i] << (i * 8));
+                    }
+
+                    uint16_t cid = cmap.get_or_insert(code, cstart, clen, country_names);
+                    if (rid < 1000000) region_to_country[rid] = cid;
+
+                    if (p < limit && *p == '\r') p++;
+                    if (p < limit && *p == '\n') p++;
+                }
+            });
         }
+        for (auto& w : r_workers) w.join();
 
         unmatched_cid = (uint16_t)country_names.size();
         country_names.push_back("_UNMATCHED");
@@ -230,7 +296,7 @@ int main(int argc, char* argv[]) {
 
     uint16_t num_countries = (uint16_t)country_names.size();
 
-    // Allocate single shared global atomic bitset (Lock-free L3 resident)
+    // Allocate single shared global atomic bitset
     size_t total_words = (size_t)num_countries * BITSET_WORDS;
     auto global_seen = std::make_unique<std::atomic<uint64_t>[]>(total_words);
 
@@ -248,151 +314,166 @@ int main(int argc, char* argv[]) {
     const char* hdr_nl = static_cast<const char*>(std::memchr(data + data_start, '\n', total_size - data_start));
     if (hdr_nl) data_start = (hdr_nl - data) + 1;
 
-    unsigned int num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 6;
-    if (num_threads > 12) num_threads = 12;
-
-    size_t chunk_bytes = (total_size - data_start) / num_threads;
-
-    std::vector<size_t> chunk_starts(num_threads);
-    std::vector<size_t> chunk_ends(num_threads);
-
-    for (unsigned int tid = 0; tid < num_threads; ++tid) {
-        size_t start = data_start + tid * chunk_bytes;
-        size_t end = (tid == num_threads - 1) ? total_size : data_start + (tid + 1) * chunk_bytes;
-
-        if (tid > 0) {
-            while (start + 1 < total_size && !(data[start] == '\r' && data[start + 1] == '\n')) {
-                start++;
-            }
-            if (start + 1 < total_size) start += 2;
-            if (start + 2 < total_size && (uint8_t)data[start] == 0xEF && (uint8_t)data[start+1] == 0xBB && (uint8_t)data[start+2] == 0xBF) {
-                start += 3;
-            }
-        }
-
-        if (tid < num_threads - 1) {
-            while (end + 1 < total_size && !(data[end] == '\r' && data[end + 1] == '\n')) {
-                end++;
-            }
-            if (end + 1 < total_size) end += 2;
-        }
-
-        chunk_starts[tid] = start;
-        chunk_ends[tid] = end;
-    }
+    constexpr size_t CHUNK_SIZE = 256 * 1024;
+    size_t num_chunks = (total_size - data_start + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    std::atomic<uint32_t> next_chunk{0};
 
     std::vector<std::vector<ThreadStats>> thread_stats(num_threads, std::vector<ThreadStats>(num_countries));
 
     std::vector<std::thread> workers;
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
-            const char* p = data + chunk_starts[tid];
-            const char* end = data + chunk_ends[tid];
             auto& stats = thread_stats[tid];
-
             char unescape_buf[512];
 
-            while (p < end) {
-                if (end - p >= 3 && (uint8_t)p[0] == 0xEF && (uint8_t)p[1] == 0xBB && (uint8_t)p[2] == 0xBF) {
-                    p += 3;
+            while (true) {
+                uint32_t c = next_chunk.fetch_add(1, std::memory_order_relaxed);
+                if (c >= num_chunks) break;
+
+                size_t start = data_start + (size_t)c * CHUNK_SIZE;
+                size_t end = std::min(data_start + ((size_t)c + 1) * CHUNK_SIZE, total_size);
+
+                if (c > 0) {
+                    while (start + 1 < total_size && !(data[start] == '\r' && data[start + 1] == '\n')) start++;
+                    if (start + 1 < total_size) start += 2;
+                    if (start + 2 < total_size && (uint8_t)data[start] == 0xEF && (uint8_t)data[start+1] == 0xBB && (uint8_t)data[start+2] == 0xBF) {
+                        start += 3;
+                    }
                 }
-                if (p >= end || *p == '\r' || *p == '\n') {
-                    if (p < end) p++;
-                    continue;
+                if (c + 1 < num_chunks) {
+                    while (end + 1 < total_size && !(data[end] == '\r' && data[end + 1] == '\n')) end++;
+                    if (end + 1 < total_size) end += 2;
                 }
 
-                int64_t rec_id = 0;
-                while (p < end && *p >= '0' && *p <= '9') {
-                    rec_id = rec_id * 10 + (*p - '0');
-                    p++;
-                }
-                if (p < end && *p == ',') p++;
+                const char* p = data + start;
+                const char* limit = data + end;
 
-                const char* name_ptr = nullptr;
-                uint32_t name_len = 0;
-                if (p < end && *p == '"') {
-                    p++;
-                    char* dest = unescape_buf;
-                    while (p < end) {
-                        if (*p == '"') {
-                            if (p + 1 < end && *(p + 1) == '"') {
-                                *dest++ = '"';
-                                p += 2;
-                            } else {
-                                p++;
-                                break;
-                            }
+                while (p < limit) {
+                    if (limit - p >= 3 && (uint8_t)p[0] == 0xEF && (uint8_t)p[1] == 0xBB && (uint8_t)p[2] == 0xBF) {
+                        p += 3;
+                    }
+                    if (p >= limit || *p == '\r' || *p == '\n') {
+                        if (p < limit) p++;
+                        continue;
+                    }
+
+                    int64_t rec_id = 0;
+                    while (p < limit && static_cast<unsigned char>(*p - '0') <= 9) {
+                        rec_id = rec_id * 10 + (*p - '0');
+                        p++;
+                    }
+                    if (p < limit && *p == ',') p++;
+
+                    const char* name_ptr = nullptr;
+                    uint32_t name_len = 0;
+                    if (p < limit && *p == '"') {
+                        p++;
+                        const char* q = static_cast<const char*>(std::memchr(p, '"', limit - p));
+                        if (q && (q + 1 < limit && *(q + 1) == ',')) {
+                            // Fast path: no internal quotes!
+                            name_ptr = p;
+                            name_len = (uint32_t)(q - p);
+                            p = q + 2; // skip quote and comma
                         } else {
-                            *dest++ = *p++;
+                            // Slower path: unescape internal quotes
+                            char* dest = unescape_buf;
+                            while (p < limit) {
+                                if (*p == '"') {
+                                    if (p + 1 < limit && *(p + 1) == '"') {
+                                        *dest++ = '"';
+                                        p += 2;
+                                    } else {
+                                        p++;
+                                        break;
+                                    }
+                                } else {
+                                    *dest++ = *p++;
+                                }
+                            }
+                            name_ptr = unescape_buf;
+                            name_len = (uint32_t)(dest - unescape_buf);
+                            if (p < limit && *p == ',') p++;
+                        }
+                    } else {
+                        const char* nstart = p;
+                        const char* comma = static_cast<const char*>(std::memchr(p, ',', limit - p));
+                        if (comma) {
+                            name_ptr = nstart;
+                            name_len = (uint32_t)(comma - nstart);
+                            p = comma + 1;
+                        } else {
+                            break;
                         }
                     }
-                    name_ptr = unescape_buf;
-                    name_len = (uint32_t)(dest - unescape_buf);
-                } else {
-                    const char* nstart = p;
-                    while (p < end && *p != ',') p++;
-                    name_ptr = nstart;
-                    name_len = (uint32_t)(p - nstart);
-                }
-                if (p < end && *p == ',') p++;
 
-                uint64_t note_len = 0;
-                if (p < end && *p == '"') {
-                    p++;
-                    while (p < end) {
-                        if (*p == '"') {
-                            if (p + 1 < end && *(p + 1) == '"') {
-                                note_len++;
-                                p += 2;
-                            } else {
-                                p++;
-                                break;
-                            }
+                    uint64_t note_len = 0;
+                    if (p < limit && *p == '"') {
+                        p++;
+                        const char* q = static_cast<const char*>(std::memchr(p, '"', limit - p));
+                        if (q && (q + 1 < limit && *(q + 1) == ',')) {
+                            // Fast path: no internal quotes!
+                            note_len = (uint64_t)(q - p);
+                            p = q + 2; // skip quote and comma
                         } else {
-                            note_len++;
-                            p++;
+                            // Slower path: count escaped note chars
+                            while (p < limit) {
+                                if (*p == '"') {
+                                    if (p + 1 < limit && *(p + 1) == '"') {
+                                        note_len++;
+                                        p += 2;
+                                    } else {
+                                        p++;
+                                        break;
+                                    }
+                                } else {
+                                    note_len++;
+                                    p++;
+                                }
+                            }
+                            if (p < limit && *p == ',') p++;
+                        }
+                    } else {
+                        const char* ntstart = p;
+                        const char* comma = static_cast<const char*>(std::memchr(p, ',', limit - p));
+                        if (comma) {
+                            note_len = (uint64_t)(comma - ntstart);
+                            p = comma + 1;
+                        } else {
+                            break;
                         }
                     }
-                } else {
-                    const char* ntstart = p;
-                    while (p < end && *p != ',') p++;
-                    note_len = (uint64_t)(p - ntstart);
-                }
-                if (p < end && *p == ',') p++;
 
-                uint32_t region_id = 0;
-                while (p < end && *p >= '0' && *p <= '9') {
-                    region_id = region_id * 10 + (*p - '0');
-                    p++;
-                }
-                if (p < end && *p == ',') p++;
+                    uint32_t region_id = 0;
+                    while (p < limit && static_cast<unsigned char>(*p - '0') <= 9) {
+                        region_id = region_id * 10 + (*p - '0');
+                        p++;
+                    }
+                    if (p < limit && *p == ',') p++;
 
-                const char* amt_start = p;
-                while (p < end && *p != '\r' && *p != '\n') p++;
-                int64_t cents = parse_cents_strict(amt_start, p);
+                    int64_t cents = parse_cents_fast(p, limit);
 
-                if (p < end && *p == '\r') p++;
-                if (p < end && *p == '\n') p++;
+                    if (p < limit && *p == '\r') p++;
+                    if (p < limit && *p == '\n') p++;
 
-                uint16_t cid = (region_id < 1000000) ? region_to_country[region_id] : 0xFFFF;
-                if (cid == 0xFFFF) cid = unmatched_cid;
+                    uint16_t cid = (region_id < 1000000) ? region_to_country[region_id] : 0xFFFF;
+                    if (cid == 0xFFFF) cid = unmatched_cid;
 
-                auto& cs = stats[cid];
-                cs.count++;
-                cs.id_sum += rec_id;
-                cs.amount_sum += cents;
-                if (cents < cs.amount_min) cs.amount_min = cents;
-                if (cents > cs.amount_max) cs.amount_max = cents;
-                cs.name_bytes += name_len;
-                cs.note_bytes += note_len;
+                    auto& cs = stats[cid];
+                    cs.count++;
+                    cs.id_sum += rec_id;
+                    cs.amount_sum += cents;
+                    if (cents < cs.amount_min) cs.amount_min = cents;
+                    if (cents > cs.amount_max) cs.amount_max = cents;
+                    cs.name_bytes += name_len;
+                    cs.note_bytes += note_len;
 
-                uint32_t nid = get_or_register_name(name_ptr, name_len);
-                size_t w_idx = (size_t)cid * BITSET_WORDS + (nid >> 6);
-                uint64_t bit = 1ULL << (nid & 63);
-                uint64_t old_val = global_seen[w_idx].load(std::memory_order_relaxed);
-                if ((old_val & bit) == 0) {
-                    global_seen[w_idx].fetch_or(bit, std::memory_order_relaxed);
+                    uint32_t nid = get_or_register_name_fast(name_ptr, name_len);
+                    size_t w_idx = (size_t)cid * BITSET_WORDS + (nid >> 6);
+                    uint64_t bit = 1ULL << (nid & 63);
+                    uint64_t old_val = global_seen[w_idx].load(std::memory_order_relaxed);
+                    if ((old_val & bit) == 0) {
+                        global_seen[w_idx].fetch_or(bit, std::memory_order_relaxed);
+                    }
                 }
             }
         });
