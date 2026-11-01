@@ -1,0 +1,36 @@
+# Binaries & build artifacts
+bin/
+*.exe
+target/
+*.o
+*.obj
+*.d
+
+# Development source root (solutions packaged in track-*/)
+src/
+speed-demon-context.md
+
+# Local benchmark data & outputs
+data/
+official/
+bench/
+scripts/
+tools/
+.out/
+out/
+*.log
+actual.txt
+expected.txt
+*.txt.out
+
+# Internal developer tooling & reports (never submitted)
+.taskcache/
+zephyr/
+tasks.json
+*.jsonl
+__pycache__/
+*.pyc
+
+# OS metadata
+.DS_Store
+Thumbs.db
