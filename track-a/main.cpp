@@ -84,12 +84,15 @@ struct LocalDict {
         uint32_t len = 0;
         const char* str = nullptr;
         uint16_t id = 0;
+        uint16_t rank = 0;
     };
     std::vector<Entry> table;
     std::vector<std::string_view> list;
+    std::vector<uint32_t> id_to_table_idx;
 
     LocalDict() : table(LOCAL_DICT_CAP) {
         list.reserve(2048);
+        id_to_table_idx.reserve(2048);
     }
 
     inline uint16_t get_or_insert(const char* p, uint32_t len) {
@@ -103,6 +106,7 @@ struct LocalDict {
             if (e.hash == 0) {
                 uint16_t id = (uint16_t)list.size();
                 list.emplace_back(p, len);
+                id_to_table_idx.push_back((uint32_t)idx);
                 e.hash = h;
                 e.len = len;
                 e.str = p;
@@ -115,16 +119,26 @@ struct LocalDict {
             idx = (idx + 1) & LOCAL_DICT_MASK;
         }
     }
-};
 
-#pragma pack(push, 1)
-struct RawItem {
-    uint8_t  hour_idx;
-    uint16_t ep_id;
-    uint8_t  is_error;
-    uint32_t latency;
+    inline void set_rank(uint16_t id, uint16_t rank) {
+        uint32_t t_idx = id_to_table_idx[id];
+        table[t_idx].rank = rank;
+    }
+
+    inline uint16_t get_rank_fast(const char* p, uint32_t len) const {
+        uint64_t h64 = hash_bytes_fast(p, len);
+        uint32_t h = (uint32_t)(h64 ^ (h64 >> 32));
+        if (h == 0) h = 1;
+        size_t idx = h & LOCAL_DICT_MASK;
+        while (true) {
+            const Entry& e = table[idx];
+            if (e.hash == h && e.len == len && std::memcmp(e.str, p, len) == 0) {
+                return e.rank;
+            }
+            idx = (idx + 1) & LOCAL_DICT_MASK;
+        }
+    }
 };
-#pragma pack(pop)
 
 inline uint32_t nearest_rank_percentile_slice(const uint32_t* sorted_vals, size_t n, uint32_t p) {
     size_t rank = (p * n + 99) / 100;
@@ -163,6 +177,11 @@ inline char* write_u64(char* p, uint64_t val) {
     return p + len;
 }
 
+struct ThreadChunk {
+    size_t start;
+    size_t end;
+};
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -190,17 +209,21 @@ int main(int argc, char* argv[]) {
     std::atomic<uint32_t> next_chunk{0};
 
     std::vector<LocalDict> thread_dicts(num_threads);
-    std::vector<std::vector<RawItem>> thread_items(num_threads);
-    for (unsigned int tid = 0; tid < num_threads; ++tid) {
-        thread_items[tid].reserve((total_size / num_threads) / 60);
-    }
+    std::vector<std::vector<ThreadChunk>> thread_chunks(num_threads);
 
-    // 1. Parallel parse with dynamic work-stealing & 8-byte SWAR method skip
+    // 72 hours * 2048 max local endpoints = 147,456 per thread (589 KB)
+    constexpr size_t LOCAL_MAX_CELLS = 72 * 2048;
+    std::vector<std::vector<uint32_t>> thread_local_counts(num_threads, std::vector<uint32_t>(LOCAL_MAX_CELLS, 0));
+    std::vector<std::vector<uint32_t>> thread_local_errors(num_threads, std::vector<uint32_t>(LOCAL_MAX_CELLS, 0));
+
+    // PASS 1: Work-stealing parse, count frequencies, record thread chunks (ZERO raw item allocations)
     std::vector<std::thread> workers;
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
             auto& dict = thread_dicts[tid];
-            auto& my_items = thread_items[tid];
+            auto& my_chunks = thread_chunks[tid];
+            auto& counts = thread_local_counts[tid];
+            auto& errors = thread_local_errors[tid];
 
             while (true) {
                 uint32_t c = next_chunk.fetch_add(1, std::memory_order_relaxed);
@@ -218,16 +241,14 @@ int main(int argc, char* argv[]) {
                     if (end < total_size) end++;
                 }
 
+                my_chunks.push_back({start, end});
+
                 const char* cur = data + start;
                 const char* limit = data + end;
 
                 while (cur < limit) {
                     const char* line_start = cur;
-                    const char* nl = static_cast<const char*>(std::memchr(cur, '\n', limit - cur));
-                    const char* line_end = nl ? nl : limit;
-                    cur = nl ? nl + 1 : limit;
-
-                    if (line_end - line_start < 30) continue;
+                    if (cur + 28 >= limit) break;
 
                     uint32_t hour_idx = parse_hour_idx(line_start);
 
@@ -235,28 +256,25 @@ int main(int argc, char* argv[]) {
                     const char* p = line_start + 28;
                     p += skip_method_swar(p);
 
-                    // Fast Endpoint Scan via memchr
+                    // Endpoint
                     const char* ep_start = p;
-                    const char* sp = static_cast<const char*>(std::memchr(p, ' ', line_end - p));
-                    if (!sp) continue;
+                    const char* sp = static_cast<const char*>(std::memchr(p, ' ', limit - p));
+                    if (!sp) break;
                     uint32_t ep_len = (uint32_t)(sp - ep_start);
-                    p = sp + 1;
 
                     uint16_t ep_id = dict.get_or_insert(ep_start, ep_len);
 
-                    // Status
-                    if (p + 3 > line_end) continue;
-                    uint8_t is_err = (p[0] == '5');
-                    p += 4;
+                    // Status: sp[1] is '2'/'3'/'4'/'5'
+                    uint8_t is_err = (sp[1] == '5');
 
-                    // Latency
-                    uint32_t latency = 0;
-                    while (p < line_end && *p >= '0' && *p <= '9') {
-                        latency = latency * 10 + (*p - '0');
-                        p++;
-                    }
+                    size_t cell = (size_t)hour_idx * 2048 + ep_id;
+                    counts[cell]++;
+                    if (is_err) errors[cell]++;
 
-                    my_items.push_back({(uint8_t)hour_idx, ep_id, is_err, latency});
+                    // Advance past latency to next line
+                    const char* p_lat = sp + 5; // sp + 1 (status 3 chars) + 1 (space) = sp + 5
+                    while (p_lat < limit && *p_lat != '\n') p_lat++;
+                    cur = p_lat + 1;
                 }
             }
         });
@@ -265,7 +283,7 @@ int main(int argc, char* argv[]) {
     for (auto& w : workers) w.join();
     workers.clear();
 
-    // 2. Build global unified endpoint dictionary
+    // BARRIER: Build unified global endpoint dictionary & lexicographical order
     std::vector<std::string_view> all_endpoints;
     all_endpoints.reserve(2048);
 
@@ -306,7 +324,7 @@ int main(int argc, char* argv[]) {
 
     uint16_t num_global_eps = (uint16_t)all_endpoints.size();
 
-    // 3. Alphabetical endpoint sorting
+    // Alphabetical endpoint sorting
     std::vector<uint16_t> sorted_order(num_global_eps);
     for (uint16_t i = 0; i < num_global_eps; ++i) sorted_order[i] = i;
     std::sort(sorted_order.begin(), sorted_order.end(), [&](uint16_t a, uint16_t b) {
@@ -318,11 +336,12 @@ int main(int argc, char* argv[]) {
         global_to_rank[sorted_order[r]] = r;
     }
 
-    // Remap tables: thread_dict_id -> rank
+    // Remap tables: thread_dict_id -> rank, and update LocalDict with ranks
     std::vector<std::vector<uint16_t>> thread_remap(num_threads);
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         auto& remap = thread_remap[tid];
-        const auto& list = thread_dicts[tid].list;
+        auto& dict = thread_dicts[tid];
+        const auto& list = dict.list;
         remap.resize(list.size());
         for (size_t i = 0; i < list.size(); ++i) {
             const auto& sv = list[i];
@@ -333,7 +352,9 @@ int main(int argc, char* argv[]) {
             while (true) {
                 const auto& s = global_table[idx];
                 if (s.hash == h && s.len == sv.size() && std::memcmp(s.str, sv.data(), sv.size()) == 0) {
-                    remap[i] = global_to_rank[s.id];
+                    uint16_t rank = global_to_rank[s.id];
+                    remap[i] = rank;
+                    dict.set_rank((uint16_t)i, rank);
                     break;
                 }
                 idx = (idx + 1) & GLOBAL_MASK;
@@ -341,30 +362,40 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 4. Count cell frequencies (72 hours x num_global_eps)
+    // Aggregate cell counts and errors
     size_t total_cells = 72 * (size_t)num_global_eps;
     std::vector<std::vector<uint32_t>> thread_cell_counts(num_threads, std::vector<uint32_t>(total_cells, 0));
     std::vector<std::vector<uint32_t>> thread_cell_errors(num_threads, std::vector<uint32_t>(total_cells, 0));
 
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
-        workers.emplace_back([&, tid]() {
-            const auto& items = thread_items[tid];
-            const auto& remap = thread_remap[tid];
-            auto& counts = thread_cell_counts[tid];
-            auto& errors = thread_cell_errors[tid];
+        const auto& remap = thread_remap[tid];
+        const auto& counts = thread_local_counts[tid];
+        const auto& errors = thread_local_errors[tid];
+        auto& cell_counts = thread_cell_counts[tid];
+        auto& cell_errors = thread_cell_errors[tid];
 
-            for (const auto& item : items) {
-                uint16_t rank = remap[item.ep_id];
-                size_t cell_idx = (size_t)item.hour_idx * num_global_eps + rank;
-                counts[cell_idx]++;
-                if (item.is_error) errors[cell_idx]++;
+        size_t num_local = remap.size();
+        for (uint32_t h = 0; h < 72; ++h) {
+            size_t local_base = (size_t)h * 2048;
+            size_t global_base = (size_t)h * num_global_eps;
+            for (size_t id = 0; id < num_local; ++id) {
+                uint32_t cnt = counts[local_base + id];
+                if (cnt > 0) {
+                    uint16_t rank = remap[id];
+                    cell_counts[global_base + rank] += cnt;
+                    cell_errors[global_base + rank] += errors[local_base + id];
+                }
             }
-        });
+        }
     }
-    for (auto& w : workers) w.join();
-    workers.clear();
 
-    // 5. Prefix sums & Flat Contiguous Array
+    // Free thread_local_counts to reclaim memory
+    thread_local_counts.clear();
+    thread_local_counts.shrink_to_fit();
+    thread_local_errors.clear();
+    thread_local_errors.shrink_to_fit();
+
+    // Compute Prefix sums
     std::vector<uint32_t> cell_totals(total_cells, 0);
     std::vector<uint32_t> cell_errors(total_cells, 0);
     std::vector<uint32_t> cell_offsets(total_cells + 1, 0);
@@ -390,30 +421,65 @@ int main(int argc, char* argv[]) {
     cell_offsets[total_cells] = running_total;
     uint32_t total_records = running_total;
 
+    // Single 12.4 MB flat contiguous array
     std::vector<uint32_t> all_latencies(total_records);
 
-    // 6. Scatter latencies into flat contiguous array
+    // PASS 2: Replay recorded chunks and write latencies directly into flat array
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
-            const auto& items = thread_items[tid];
-            const auto& remap = thread_remap[tid];
+            const auto& dict = thread_dicts[tid];
+            const auto& my_chunks = thread_chunks[tid];
             auto& write_ptrs = thread_write_offsets[tid];
 
-            for (const auto& item : items) {
-                uint16_t rank = remap[item.ep_id];
-                size_t cell_idx = (size_t)item.hour_idx * num_global_eps + rank;
-                uint32_t pos = write_ptrs[cell_idx]++;
-                all_latencies[pos] = item.latency;
+            for (const auto& chk : my_chunks) {
+                const char* cur = data + chk.start;
+                const char* limit = data + chk.end;
+
+                while (cur < limit) {
+                    const char* line_start = cur;
+                    if (cur + 28 >= limit) break;
+
+                    uint32_t hour_idx = parse_hour_idx(line_start);
+
+                    // SWAR Method Skip
+                    const char* p = line_start + 28;
+                    p += skip_method_swar(p);
+
+                    // Endpoint
+                    const char* ep_start = p;
+                    const char* sp = static_cast<const char*>(std::memchr(p, ' ', limit - p));
+                    if (!sp) break;
+                    uint32_t ep_len = (uint32_t)(sp - ep_start);
+
+                    uint16_t rank = dict.get_rank_fast(ep_start, ep_len);
+
+                    // Latency: sp + 5 points to start of latency digits
+                    const char* p_lat = sp + 5;
+                    uint32_t latency = 0;
+                    while (p_lat < limit && *p_lat != '\n') {
+                        latency = latency * 10 + (*p_lat - '0');
+                        p_lat++;
+                    }
+                    cur = p_lat + 1;
+
+                    size_t cell_idx = (size_t)hour_idx * num_global_eps + rank;
+                    uint32_t pos = write_ptrs[cell_idx]++;
+                    all_latencies[pos] = latency;
+                }
             }
         });
     }
+
     for (auto& w : workers) w.join();
     workers.clear();
 
-    thread_items.clear();
-    thread_items.shrink_to_fit();
+    // Free write offset structures
+    thread_write_offsets.clear();
+    thread_write_offsets.shrink_to_fit();
+    thread_chunks.clear();
+    thread_chunks.shrink_to_fit();
 
-    // 7. Parallel sorting & output formatting per hour chunk
+    // PASS 3: Parallel sorting & output formatting per hour chunk
     std::vector<std::string> thread_output_strings(num_threads);
     uint32_t hours_per_thread = (72 + num_threads - 1) / num_threads;
 
