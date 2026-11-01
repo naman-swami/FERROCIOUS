@@ -1,4 +1,4 @@
-// FERROCIOUS Track B — Optimized Parallel Indexing & Query Engine
+// FERROCIOUS Track B — Ultra-Fast Flat Hash Inverted Index Engine
 // Zero External Dependencies (D = 1.00). C++20.
 
 #include <iostream>
@@ -24,12 +24,23 @@ inline constexpr auto TOKEN_CHAR = [] {
     return t;
 }();
 
-struct TransparentStringHash {
-    using is_transparent = void;
-    size_t operator()(std::string_view sv) const noexcept {
-        return ferocious::hash64(sv.data(), sv.size());
+inline uint64_t fnv1a_str(std::string_view sv) {
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (char c : sv) {
+        h = (h ^ (uint8_t)TOKEN_CHAR[(uint8_t)c]) * 0x100000001b3ULL;
     }
+    return h == 0 ? 1 : h;
+}
+
+static constexpr size_t VOCAB_CAP = 262144;
+static constexpr size_t VOCAB_MASK = VOCAB_CAP - 1;
+
+struct VocabSlot {
+    uint64_t hash = 0;
+    uint32_t token_id = 0;
 };
+
+static VocabSlot vocab_table[VOCAB_CAP];
 
 inline void append_u32(std::string& s, uint32_t v) {
     char buf[16];
@@ -90,15 +101,29 @@ int main(int argc, char* argv[]) {
 
     // 1. Parse all queries to extract query lines and active vocabulary
     std::vector<std::string_view> query_lines;
-    std::unordered_map<std::string, uint32_t, TransparentStringHash, std::equal_to<>> token_to_id;
-    token_to_id.reserve(131072);
+    uint32_t num_active_tokens = 0;
 
-    auto get_or_add_token = [&](std::string_view sv) -> uint32_t {
-        auto it = token_to_id.find(sv);
-        if (it != token_to_id.end()) return it->second;
-        uint32_t new_id = static_cast<uint32_t>(token_to_id.size());
-        token_to_id.emplace(std::string(sv), new_id);
+    auto insert_token = [&](std::string_view sv) -> uint32_t {
+        uint64_t h = fnv1a_str(sv);
+        size_t slot = h & VOCAB_MASK;
+        while (vocab_table[slot].hash != 0) {
+            if (vocab_table[slot].hash == h) return vocab_table[slot].token_id;
+            slot = (slot + 1) & VOCAB_MASK;
+        }
+        uint32_t new_id = num_active_tokens++;
+        vocab_table[slot].hash = h;
+        vocab_table[slot].token_id = new_id;
         return new_id;
+    };
+
+    auto find_token = [&](std::string_view sv) -> int64_t {
+        uint64_t h = fnv1a_str(sv);
+        size_t slot = h & VOCAB_MASK;
+        while (vocab_table[slot].hash != 0) {
+            if (vocab_table[slot].hash == h) return vocab_table[slot].token_id;
+            slot = (slot + 1) & VOCAB_MASK;
+        }
+        return -1;
     };
 
     {
@@ -121,7 +146,7 @@ int main(int argc, char* argv[]) {
                         size_t next_sp = rest.find(' ', pos);
                         std::string_view part = (next_sp == std::string_view::npos) ? rest.substr(pos) : rest.substr(pos, next_sp - pos);
                         if (part != "AND" && part != "OR" && part != "NOT") {
-                            get_or_add_token(part);
+                            insert_token(part);
                         }
                         if (next_sp == std::string_view::npos) break;
                         pos = next_sp + 1;
@@ -134,7 +159,7 @@ int main(int argc, char* argv[]) {
                         size_t next_sp = inner.find(' ', pos);
                         std::string_view part = (next_sp == std::string_view::npos) ? inner.substr(pos) : inner.substr(pos, next_sp - pos);
                         if (!part.empty()) {
-                            get_or_add_token(part);
+                            insert_token(part);
                         }
                         if (next_sp == std::string_view::npos) break;
                         pos = next_sp + 1;
@@ -145,9 +170,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    uint32_t num_active_tokens = static_cast<uint32_t>(token_to_id.size());
-
-    // 2. Pre-scan docs to find doc boundaries and line pointers
+    // 2. Pre-scan docs to find doc boundaries
     struct DocSpan {
         const char* start = nullptr;
         const char* end = nullptr;
@@ -176,7 +199,7 @@ int main(int argc, char* argv[]) {
 
     size_t total_docs = doc_spans.size();
 
-    // 3. Parallel Tokenization and Posting Indexing
+    // 3. Ultra-Fast Parallel Register-Hashing Tokenization across 12 threads
     std::vector<std::vector<std::vector<uint32_t>>> thread_indexes(num_threads);
     for (unsigned tid = 0; tid < num_threads; ++tid) {
         thread_indexes[tid].resize(num_active_tokens);
@@ -193,8 +216,6 @@ int main(int argc, char* argv[]) {
             if (start_id >= end_id) return;
 
             auto& local_index = thread_indexes[tid];
-            std::string lower_token;
-            lower_token.reserve(128);
             std::vector<uint32_t> doc_active_ids;
             doc_active_ids.reserve(64);
 
@@ -207,14 +228,21 @@ int main(int argc, char* argv[]) {
                 while (p < text_end) {
                     while (p < text_end && TOKEN_CHAR[(uint8_t)*p] == 0) p++;
                     if (p >= text_end) break;
-                    lower_token.clear();
+
+                    uint64_t h = 0xcbf29ce484222325ULL;
                     while (p < text_end && TOKEN_CHAR[(uint8_t)*p] != 0) {
-                        lower_token.push_back((char)TOKEN_CHAR[(uint8_t)*p]);
+                        h = (h ^ TOKEN_CHAR[(uint8_t)*p]) * 0x100000001b3ULL;
                         p++;
                     }
-                    auto it = token_to_id.find(std::string_view(lower_token));
-                    if (it != token_to_id.end()) {
-                        doc_active_ids.push_back(it->second);
+                    if (h == 0) h = 1;
+
+                    size_t slot = h & VOCAB_MASK;
+                    while (vocab_table[slot].hash != 0) {
+                        if (vocab_table[slot].hash == h) {
+                            doc_active_ids.push_back(vocab_table[slot].token_id);
+                            break;
+                        }
+                        slot = (slot + 1) & VOCAB_MASK;
                     }
                 }
 
@@ -223,9 +251,7 @@ int main(int argc, char* argv[]) {
                     doc_active_ids.erase(std::unique(doc_active_ids.begin(), doc_active_ids.end()), doc_active_ids.end());
 
                     for (uint32_t tok_id : doc_active_ids) {
-                        if (tok_id < num_active_tokens) {
-                            local_index[tok_id].push_back(static_cast<uint32_t>(doc_id));
-                        }
+                        local_index[tok_id].push_back(static_cast<uint32_t>(doc_id));
                     }
                 }
             }
@@ -295,21 +321,21 @@ int main(int argc, char* argv[]) {
                         continue;
                     }
 
-                    auto it0 = token_to_id.find(parts[0]);
+                    int64_t id0 = find_token(parts[0]);
                     std::vector<uint32_t>* cur_buf = &buf_a;
                     std::vector<uint32_t>* next_buf = &buf_b;
                     cur_buf->clear();
 
-                    if (it0 != token_to_id.end() && it0->second < global_index.size()) {
-                        *cur_buf = global_index[it0->second];
+                    if (id0 >= 0 && (size_t)id0 < global_index.size()) {
+                        *cur_buf = global_index[id0];
                     }
 
                     for (size_t i = 1; i + 1 < parts.size(); i += 2) {
                         std::string_view op = parts[i];
                         std::string_view term = parts[i + 1];
 
-                        auto post_it = token_to_id.find(term);
-                        const std::vector<uint32_t>* postings = (post_it != token_to_id.end() && post_it->second < global_index.size()) ? &global_index[post_it->second] : nullptr;
+                        int64_t post_id = find_token(term);
+                        const std::vector<uint32_t>* postings = (post_id >= 0 && (size_t)post_id < global_index.size()) ? &global_index[post_id] : nullptr;
 
                         next_buf->clear();
                         if (op == "AND") {
@@ -374,25 +400,25 @@ int main(int argc, char* argv[]) {
                         continue;
                     }
 
-                    auto it0 = token_to_id.find(phrase_terms[0]);
+                    int64_t id0 = find_token(phrase_terms[0]);
                     std::vector<uint32_t>* cur_cand = &buf_a;
                     std::vector<uint32_t>* next_cand = &buf_b;
                     cur_cand->clear();
 
-                    if (it0 != token_to_id.end() && it0->second < global_index.size()) {
-                        *cur_cand = global_index[it0->second];
+                    if (id0 >= 0 && (size_t)id0 < global_index.size()) {
+                        *cur_cand = global_index[id0];
                     }
 
                     bool possible = !cur_cand->empty();
                     for (size_t i = 1; i < phrase_terms.size() && possible; ++i) {
-                        auto pit = token_to_id.find(phrase_terms[i]);
-                        if (pit == token_to_id.end() || pit->second >= global_index.size()) {
+                        int64_t post_id = find_token(phrase_terms[i]);
+                        if (post_id < 0 || (size_t)post_id >= global_index.size()) {
                             cur_cand->clear();
                             possible = false;
                             break;
                         }
                         next_cand->clear();
-                        const auto& plist = global_index[pit->second];
+                        const auto& plist = global_index[post_id];
                         std::set_intersection(cur_cand->begin(), cur_cand->end(),
                                               plist.begin(), plist.end(),
                                               std::back_inserter(*next_cand));

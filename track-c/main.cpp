@@ -71,11 +71,16 @@ inline uint64_t hash_bytes(const char* p, size_t len) {
     return h;
 }
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 static constexpr size_t POOL_CAP = 262144;
 static constexpr size_t POOL_MASK = POOL_CAP - 1;
 
 struct PoolSlot {
-    std::atomic<uint64_t> hash{0};
+    std::atomic<uint32_t> state{0}; // 0 = empty, 1 = reserving, 2 = ready
+    uint64_t hash = 0;
     uint32_t offset = 0;
     uint32_t len = 0;
     uint32_t name_id = 0;
@@ -83,9 +88,8 @@ struct PoolSlot {
 
 static PoolSlot pool_table[POOL_CAP];
 static char pool_arena[8 * 1024 * 1024]; // 8 MB fixed arena, never reallocates
-static uint32_t pool_arena_size = 0;
-static std::mutex pool_mutex;
-static uint32_t pool_next_id = 0;
+static std::atomic<uint32_t> pool_arena_size{0};
+static std::atomic<uint32_t> pool_next_id{0};
 
 inline uint32_t get_or_register_name(const char* s, size_t len) {
     uint64_t h = hash_bytes(s, len);
@@ -93,26 +97,36 @@ inline uint32_t get_or_register_name(const char* s, size_t len) {
 
     size_t idx = h & POOL_MASK;
     while (true) {
-        uint64_t cur_h = pool_table[idx].hash.load(std::memory_order_acquire);
-        if (cur_h == 0) {
-            std::lock_guard<std::mutex> lock(pool_mutex);
-            if (pool_table[idx].hash.load(std::memory_order_relaxed) == 0) {
-                uint32_t off = pool_arena_size;
+        uint32_t st = pool_table[idx].state.load(std::memory_order_acquire);
+        if (st == 0) {
+            uint32_t expected = 0;
+            if (pool_table[idx].state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+                // Claimed slot
+                uint32_t off = pool_arena_size.fetch_add((uint32_t)len, std::memory_order_relaxed);
                 std::memcpy(pool_arena + off, s, len);
-                pool_arena_size += (uint32_t)len;
-                uint32_t nid = pool_next_id++;
+                uint32_t nid = pool_next_id.fetch_add(1, std::memory_order_relaxed);
                 pool_table[idx].offset = off;
                 pool_table[idx].len = (uint32_t)len;
                 pool_table[idx].name_id = nid;
-                pool_table[idx].hash.store(h, std::memory_order_release);
+                pool_table[idx].hash = h;
+                pool_table[idx].state.store(2, std::memory_order_release);
                 return nid;
             }
-            cur_h = pool_table[idx].hash.load(std::memory_order_acquire);
+            st = pool_table[idx].state.load(std::memory_order_acquire);
         }
-        if (cur_h == h && pool_table[idx].len == len &&
+
+        while (st == 1) {
+            #if defined(__x86_64__) || defined(_M_X64)
+            _mm_pause();
+            #endif
+            st = pool_table[idx].state.load(std::memory_order_acquire);
+        }
+
+        if (st == 2 && pool_table[idx].hash == h && pool_table[idx].len == len &&
             std::memcmp(pool_arena + pool_table[idx].offset, s, len) == 0) {
             return pool_table[idx].name_id;
         }
+
         idx = (idx + 1) & POOL_MASK;
     }
 }
