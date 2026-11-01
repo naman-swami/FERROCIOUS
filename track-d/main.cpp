@@ -1,4 +1,4 @@
-// FERROCIOUS Track D — 12-Thread Bidirectional 4-ary Heap Dijkstra Engine (specs/d-traverse.md)
+// FERROCIOUS Track D — High-Performance Parallel CSR + Bidirectional 4-ary Heap Dijkstra Engine
 // Zero External Dependencies (D = 1.00). C++20.
 
 #include <iostream>
@@ -98,83 +98,129 @@ int main(int argc, char* argv[]) {
 
     while (gp < gend && (*gp == ' ' || *gp == '\t' || *gp == '\r' || *gp == '\n')) gp++;
     uint32_t n = 0, m = 0;
-    while (gp < gend && *gp >= '0' && *gp <= '9') {
-        n = n * 10 + (*gp - '0');
-        gp++;
-    }
+    while (gp < gend && *gp >= '0' && *gp <= '9') n = n * 10 + (*gp++ - '0');
     while (gp < gend && (*gp == ' ' || *gp == '\t')) gp++;
-    while (gp < gend && *gp >= '0' && *gp <= '9') {
-        m = m * 10 + (*gp - '0');
-        gp++;
-    }
+    while (gp < gend && *gp >= '0' && *gp <= '9') m = m * 10 + (*gp++ - '0');
     while (gp < gend && *gp != '\n') gp++;
     if (gp < gend && *gp == '\n') gp++;
 
-    // Forward & Reverse CSR
+    const char* start_p = gp;
+    size_t total_edge_bytes = gend - start_p;
+
+    unsigned int num_threads = std::thread::hardware_concurrency();
+    if (num_threads == 0) num_threads = 6;
+    if (num_threads > 12) num_threads = 12;
+
+    std::vector<const char*> chunk_starts(num_threads);
+    std::vector<const char*> chunk_ends(num_threads);
+    size_t chunk_bytes = total_edge_bytes / num_threads;
+
+    for (unsigned int tid = 0; tid < num_threads; ++tid) {
+        const char* s = start_p + tid * chunk_bytes;
+        const char* e = (tid == num_threads - 1) ? gend : start_p + (tid + 1) * chunk_bytes;
+        if (tid > 0) { while (s < gend && *s != '\n') s++; if (s < gend) s++; }
+        if (tid < num_threads - 1) { while (e < gend && *e != '\n') e++; if (e < gend) e++; }
+        chunk_starts[tid] = s;
+        chunk_ends[tid] = e;
+    }
+
+    struct ThreadEdges {
+        std::vector<uint32_t> u;
+        std::vector<uint32_t> v;
+        std::vector<uint64_t> w;
+    };
+    std::vector<ThreadEdges> thread_data(num_threads);
+    std::vector<std::atomic<uint32_t>> fwd_degree(n + 2);
+    std::vector<std::atomic<uint32_t>> rev_degree(n + 2);
+    for (uint32_t i = 0; i <= n + 1; ++i) {
+        fwd_degree[i].store(0, std::memory_order_relaxed);
+        rev_degree[i].store(0, std::memory_order_relaxed);
+    }
+
+    // 1. Parallel Parsing & Degree Counting
+    std::vector<std::thread> workers;
+    for (unsigned int tid = 0; tid < num_threads; ++tid) {
+        workers.emplace_back([&, tid]() {
+            auto& td = thread_data[tid];
+            td.u.reserve(m / num_threads + 10000);
+            td.v.reserve(m / num_threads + 10000);
+            td.w.reserve(m / num_threads + 10000);
+
+            const char* p = chunk_starts[tid];
+            const char* limit = chunk_ends[tid];
+            while (p < limit) {
+                while (p < limit && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+                if (p >= limit) break;
+                uint32_t u = 0;
+                while (p < limit && *p >= '0' && *p <= '9') u = u * 10 + (*p++ - '0');
+                while (p < limit && (*p == ' ' || *p == '\t')) p++;
+                uint32_t v = 0;
+                while (p < limit && *p >= '0' && *p <= '9') v = v * 10 + (*p++ - '0');
+                while (p < limit && (*p == ' ' || *p == '\t')) p++;
+                uint64_t w = 0;
+                while (p < limit && *p >= '0' && *p <= '9') w = w * 10 + (*p++ - '0');
+                while (p < limit && *p != '\n') p++;
+                if (p < limit && *p == '\n') p++;
+
+                td.u.push_back(u);
+                td.v.push_back(v);
+                td.w.push_back(w);
+
+                fwd_degree[u + 1].fetch_add(1, std::memory_order_relaxed);
+                rev_degree[v + 1].fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    workers.clear();
+
+    // 2. Prefix Sums
     std::vector<uint32_t> fwd_head(n + 2, 0);
     std::vector<uint32_t> rev_head(n + 2, 0);
-
-    struct Edge {
-        uint32_t u, v;
-        uint64_t w;
-    };
-    std::vector<Edge> edge_list;
-    edge_list.reserve(m);
-
-    while (gp < gend) {
-        while (gp < gend && (*gp == ' ' || *gp == '\t' || *gp == '\r' || *gp == '\n')) gp++;
-        if (gp >= gend) break;
-
-        uint32_t u = 0;
-        while (gp < gend && *gp >= '0' && *gp <= '9') {
-            u = u * 10 + (*gp - '0');
-            gp++;
-        }
-        while (gp < gend && (*gp == ' ' || *gp == '\t')) gp++;
-
-        uint32_t v = 0;
-        while (gp < gend && *gp >= '0' && *gp <= '9') {
-            v = v * 10 + (*gp - '0');
-            gp++;
-        }
-        while (gp < gend && (*gp == ' ' || *gp == '\t')) gp++;
-
-        uint64_t w = 0;
-        while (gp < gend && *gp >= '0' && *gp <= '9') {
-            w = w * 10 + (*gp - '0');
-            gp++;
-        }
-
-        fwd_head[u + 1]++;
-        rev_head[v + 1]++;
-        edge_list.push_back({u, v, w});
-    }
+    std::vector<std::atomic<uint32_t>> cur_fwd(n + 2);
+    std::vector<std::atomic<uint32_t>> cur_rev(n + 2);
 
     for (uint32_t i = 0; i <= n; ++i) {
-        fwd_head[i + 1] += fwd_head[i];
-        rev_head[i + 1] += rev_head[i];
+        fwd_head[i + 1] = fwd_head[i] + fwd_degree[i + 1].load(std::memory_order_relaxed);
+        rev_head[i + 1] = rev_head[i] + rev_degree[i + 1].load(std::memory_order_relaxed);
+        cur_fwd[i].store(fwd_head[i], std::memory_order_relaxed);
+        cur_rev[i].store(rev_head[i], std::memory_order_relaxed);
     }
+    std::vector<std::atomic<uint32_t>>().swap(fwd_degree);
+    std::vector<std::atomic<uint32_t>>().swap(rev_degree);
 
     std::vector<uint32_t> fwd_to(m);
     std::vector<uint64_t> fwd_w(m);
-    std::vector<uint32_t> cur_fwd = fwd_head;
-
     std::vector<uint32_t> rev_to(m);
     std::vector<uint64_t> rev_w(m);
-    std::vector<uint32_t> cur_rev = rev_head;
 
-    for (const auto& e : edge_list) {
-        uint32_t fp = cur_fwd[e.u]++;
-        fwd_to[fp] = e.v;
-        fwd_w[fp] = e.w;
+    // 3. Parallel Scatter into CSR
+    for (unsigned int tid = 0; tid < num_threads; ++tid) {
+        workers.emplace_back([&, tid]() {
+            const auto& td = thread_data[tid];
+            size_t count = td.u.size();
+            for (size_t i = 0; i < count; ++i) {
+                uint32_t u = td.u[i];
+                uint32_t v = td.v[i];
+                uint64_t w = td.w[i];
 
-        uint32_t rp = cur_rev[e.v]++;
-        rev_to[rp] = e.u;
-        rev_w[rp] = e.w;
+                uint32_t fp = cur_fwd[u].fetch_add(1, std::memory_order_relaxed);
+                fwd_to[fp] = v;
+                fwd_w[fp] = w;
+
+                uint32_t rp = cur_rev[v].fetch_add(1, std::memory_order_relaxed);
+                rev_to[rp] = u;
+                rev_w[rp] = w;
+            }
+        });
     }
-    std::vector<Edge>().swap(edge_list);
+    for (auto& w : workers) w.join();
+    workers.clear();
+    std::vector<ThreadEdges>().swap(thread_data);
+    std::vector<std::atomic<uint32_t>>().swap(cur_fwd);
+    std::vector<std::atomic<uint32_t>>().swap(cur_rev);
 
-    // Parse queries
+    // 4. Parse queries
     ferocious::MappedFile qmf(queries_path.c_str());
     if (!qmf.ok) return 1;
 
@@ -183,21 +229,18 @@ int main(int argc, char* argv[]) {
 
     std::vector<std::pair<uint32_t, uint32_t>> queries;
     while (qp < qend) {
-        while (qp < qend && (*qp == ' ' || *qp == '\t' || *qp == '\r' || *gp == '\n' || *qp == '\n')) qp++;
+        while (qp < qend && (*qp == ' ' || *qp == '\t' || *qp == '\r' || *qp == '\n')) qp++;
         if (qp >= qend) break;
 
         uint32_t s = 0;
-        while (qp < qend && *qp >= '0' && *qp <= '9') {
-            s = s * 10 + (*qp - '0');
-            qp++;
-        }
+        while (qp < qend && *qp >= '0' && *qp <= '9') s = s * 10 + (*qp++ - '0');
         while (qp < qend && (*qp == ' ' || *qp == '\t')) qp++;
 
         uint32_t t = 0;
-        while (qp < qend && *qp >= '0' && *qp <= '9') {
-            t = t * 10 + (*qp - '0');
-            qp++;
-        }
+        while (qp < qend && *qp >= '0' && *qp <= '9') t = t * 10 + (*qp++ - '0');
+        while (qp < qend && *qp != '\n') qp++;
+        if (qp < qend && *qp == '\n') qp++;
+
         queries.push_back({s, t});
     }
 
@@ -205,20 +248,15 @@ int main(int argc, char* argv[]) {
     std::vector<int64_t> answers(num_queries, -1);
     std::atomic<size_t> query_idx{0};
 
-    unsigned int num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 6;
-    if (num_threads > 12) num_threads = 12;
-
-    std::vector<std::thread> workers;
-
+    // 5. Parallel Bidirectional Dijkstra
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&]() {
             std::vector<uint64_t> f_dist(n, INF64);
             std::vector<uint64_t> r_dist(n, INF64);
             std::vector<uint32_t> f_visited;
             std::vector<uint32_t> r_visited;
-            f_visited.reserve(2048);
-            r_visited.reserve(2048);
+            f_visited.reserve(4096);
+            r_visited.reserve(4096);
 
             MinHeap4 f_heap;
             MinHeap4 r_heap;
@@ -305,11 +343,9 @@ int main(int argc, char* argv[]) {
         });
     }
 
-    for (auto& w : workers) {
-        w.join();
-    }
+    for (auto& w : workers) w.join();
 
-    // Write distances.txt
+    // 6. Write distances.txt
     #ifdef _WIN32
     CreateDirectoryA(out_dir.c_str(), NULL);
     #endif
