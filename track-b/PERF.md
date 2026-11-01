@@ -10,7 +10,7 @@ Every step from the reference to your final version, each with the live-board ru
 | 3 | Flat 262k open-addressing register-hash vocabulary table: zero-allocation token lookup | run-cbfc06a | 1.085 | 250 | 45.40 |
 | 4 | AVX2 SIMD parallel chunk doc scan, 12-thread parallel index merge & zero-allocation phrase verification | run-72dbc688263e | 1.032 | 248 | 45.66 |
 | 5 | 1-Pass Flat CSR Index, 20 MB tuple buffering, branchless pointer set algebra, zero-heap streaming phrase engine | run-8d811046ccb1 | 0.944 | 296 | 45.65 |
-| 6 | 2-Pass Flat CSR with zero intermediate tuples & zero-heap stack-allocated query parser | pending | | | |
+| 6 | 2-Pass Flat CSR with zero intermediate tuples & zero-heap stack-allocated query parser | run-132d5da9de9b | 1.141 | 148 | 46.44 |
 
 - **Step 1:** Implemented zero-dependency C++20 parallel document tokenizer and inverted index builder, eliminating Python regex and heap thrashing. Runtime dropped from 56.35s to 2.458s (`run-097be6b7c1d5`).
 - **Step 2:** Extracted unique active query tokens into contiguous 32-bit integer IDs to replace string hash table lookups during indexing with direct vector array accesses. Implemented alternating ping-pong scratch buffers (`buf_a` / `buf_b`) for boolean set intersections and phrase candidate filtering, eliminating hundreds of thousands of heap allocations per query run. Runtime dropped from 2.458s to 1.349s with memory reduced to 250 MB (`run-8036c4156bbe`).
