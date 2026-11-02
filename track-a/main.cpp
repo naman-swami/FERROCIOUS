@@ -49,33 +49,24 @@ constexpr unsigned kMaxThreads = 12;
 
 inline uint64_t rd8(const char* p) { uint64_t w; memcpy(&w, p, 8); return w; }
 inline uint64_t rd4(const char* p) { uint32_t w; memcpy(&w, p, 4); return w; }
-inline uint64_t mum(uint64_t a, uint64_t b) {
-    __uint128_t r = (__uint128_t)a * b;
-    return (uint64_t)r ^ (uint64_t)(r >> 64);
-}
 
 inline uint64_t hash_ep(const char* p, uint32_t len) {
-    constexpr uint64_t S0 = 0xA0761D6478BD642FULL, S1 = 0xE7037ED1A0B428DBULL;
-    uint64_t seed = S0 ^ len, a, b;
-    if (LIKELY(len >= 16)) {
-        const char* q = p;
-        uint32_t i = len;
-        while (i > 16) { seed = mum(rd8(q) ^ S1, rd8(q + 8) ^ seed); q += 16; i -= 16; }
-        a = rd8(q + i - 16);
-        b = rd8(q + i - 8);
-    } else if (len >= 8) {
-        a = rd8(p);
-        b = rd8(p + len - 8);
-    } else if (len >= 4) {
-        a = rd4(p);
-        b = rd4(p + len - 4);
-    } else {
-        a = len ? ((uint64_t)(uint8_t)p[0] << 16) | ((uint64_t)(uint8_t)p[len >> 1] << 8) | (uint8_t)p[len - 1] : 0;
-        b = 0;
+    uint64_t h = len;
+    while (len >= 8) {
+        uint64_t v; memcpy(&v, p, 8);
+        h = _mm_crc32_u64(h, v);
+        p += 8; len -= 8;
     }
-    __uint128_t r = (__uint128_t)(a ^ S1) * (b ^ seed);
-    uint64_t h = mum((uint64_t)r ^ S0 ^ len, (uint64_t)(r >> 64) ^ S1);
-    return h + (h == 0);
+    if (len >= 4) {
+        uint32_t v; memcpy(&v, p, 4);
+        h = _mm_crc32_u32((uint32_t)h, v);
+        p += 4; len -= 4;
+    }
+    while (len > 0) {
+        h = _mm_crc32_u8((uint32_t)h, (uint8_t)*p++);
+        len--;
+    }
+    return h ? h : 1;
 }
 
 std::mutex g_mu;

@@ -346,7 +346,7 @@ int main(int argc, char* argv[]) {
     const char* hdr_nl = static_cast<const char*>(std::memchr(data + data_start, '\n', total_size - data_start));
     if (hdr_nl) data_start = (hdr_nl - data) + 1;
 
-    constexpr size_t CHUNK_SIZE = 1024 * 1024;
+    constexpr size_t CHUNK_SIZE = 256 * 1024;
     size_t num_chunks = (total_size - data_start + CHUNK_SIZE - 1) / CHUNK_SIZE;
     std::atomic<uint32_t> next_chunk{0};
 
