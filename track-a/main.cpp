@@ -196,8 +196,8 @@ int main(int argc, char* argv[]) {
     std::ios_base::sync_with_stdio(false);
     std::cin.tie(NULL);
 
-    std::string data_dir = (argc > 1) ? argv[1] : "data/official_full/a";
-    std::string out_dir  = (argc > 2) ? argv[2] : "out_test_a";
+    std::string data_dir = (argc > 1) ? argv[1] : "/data";
+    std::string out_dir  = (argc > 2) ? argv[2] : "/out";
 
     std::string input_path = data_dir + "/requests.log";
     std::string output_path = out_dir + "/summary.txt";
