@@ -124,7 +124,7 @@ inline void format_cents(int64_t cents, OutBuf& out) {
     out.put('0' + (rem % 10));
 }
 
-inline int64_t parse_cents_fast(const char*& p, const char* end) {
+inline int64_t parse_cents_fast(const char* p, const char* end) {
     bool neg = false;
     if (p < end && *p == '-') {
         neg = true;
@@ -247,7 +247,6 @@ struct ThreadStats {
 };
 
 static constexpr size_t BITSET_WORDS = 2048;
-
 static uint16_t region_to_country[1000000];
 
 } // namespace
@@ -382,138 +381,165 @@ int main(int argc, char* argv[]) {
                 const char* p = data + start;
                 const char* limit = data + end;
 
-                while (p < limit) {
-                    if (limit - p >= 3 && (uint8_t)p[0] == 0xEF && (uint8_t)p[1] == 0xBB && (uint8_t)p[2] == 0xBF) {
-                        p += 3;
-                    }
-                    if (p >= limit || *p == '\r' || *p == '\n') {
-                        if (p < limit) p++;
-                        continue;
-                    }
+                // SIMD PCLMULQDQ fast parser for 64B blocks
+                uint64_t in_q = 0;
+                int cur_field_idx = 0;
+                const char* cur_field_start = p;
+                const char* id_s = p; const char* id_e = p;
+                const char* name_s = p; const char* name_e = p;
+                const char* note_s = p; const char* note_e = p;
+                const char* reg_s = p; const char* reg_e = p;
 
-                    int64_t rec_id = 0;
-                    while (p < limit && static_cast<unsigned char>(*p - '0') <= 9) {
-                        rec_id = rec_id * 10 + (*p - '0');
-                        p++;
-                    }
-                    if (p < limit && *p == ',') p++;
+                while (cur_field_start < limit && p < data + total_size) {
+                    __m256i v0 = _mm256_loadu_si256((const __m256i*)p);
+                    __m256i v1 = _mm256_loadu_si256((const __m256i*)(p + 32));
 
-                    const char* name_ptr = nullptr;
-                    uint32_t name_len = 0;
-                    if (p < limit && *p == '"') {
-                        p++;
-                        size_t scan_len = std::min<size_t>(limit - p, 64);
-                        const char* q = static_cast<const char*>(std::memchr(p, '"', scan_len));
-                        if (q && (q + 1 < limit && *(q + 1) == ',')) {
-                            name_ptr = p;
-                            name_len = (uint32_t)(q - p);
-                            p = q + 2;
+                    uint32_t q0 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8('"')));
+                    uint32_t q1 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8('"')));
+                    uint64_t quotes = (uint64_t)q0 | ((uint64_t)q1 << 32);
+
+                    uint32_t c0 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8(',')));
+                    uint32_t c1 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8(',')));
+                    uint64_t commas = (uint64_t)c0 | ((uint64_t)c1 << 32);
+
+                    uint32_t n0 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, _mm256_set1_epi8('\n')));
+                    uint32_t n1 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, _mm256_set1_epi8('\n')));
+                    uint64_t nls = (uint64_t)n0 | ((uint64_t)n1 << 32);
+
+                    __m128i pre = _mm_clmulepi64_si128(_mm_cvtsi64_si128((int64_t)quotes), _mm_set1_epi8(-1), 0x00);
+                    uint64_t P = (uint64_t)_mm_cvtsi128_si64(pre);
+                    if (in_q) P ^= ~0ULL;
+                    in_q ^= (__builtin_popcountll(quotes) & 1);
+
+                    uint64_t v_commas = commas & ~P;
+                    uint64_t v_nls = nls & ~P;
+                    uint64_t seps = v_commas | v_nls;
+
+                    while (seps) {
+                        unsigned b = (unsigned)__builtin_ctzll(seps);
+                        const char* sep_ptr = p + b;
+                        seps &= seps - 1;
+
+                        if ((v_commas >> b) & 1) {
+                            if (cur_field_idx == 0) { id_s = cur_field_start; id_e = sep_ptr; }
+                            else if (cur_field_idx == 1) { name_s = cur_field_start; name_e = sep_ptr; }
+                            else if (cur_field_idx == 2) { note_s = cur_field_start; note_e = sep_ptr; }
+                            else if (cur_field_idx == 3) { reg_s = cur_field_start; reg_e = sep_ptr; }
+                            cur_field_idx++;
+                            cur_field_start = sep_ptr + 1;
                         } else {
-                            char* dest = unescape_buf;
-                            while (p < limit) {
-                                if (*p == '"') {
-                                    if (p + 1 < limit && *(p + 1) == '"') {
-                                        *dest++ = '"';
-                                        p += 2;
-                                    } else {
-                                        p++;
-                                        break;
+                            const char* amt_s = cur_field_start;
+                            const char* amt_e = sep_ptr;
+                            if (amt_e > amt_s && amt_e[-1] == '\r') amt_e--;
+
+                            // Process completed row
+                            if (cur_field_idx == 4) {
+                                // id
+                                while (id_s < id_e && (uint8_t)*id_s <= ' ') id_s++;
+                                if (id_e - id_s >= 3 && (uint8_t)id_s[0] == 0xEF && (uint8_t)id_s[1] == 0xBB && (uint8_t)id_s[2] == 0xBF) id_s += 3;
+                                int64_t rec_id = 0;
+                                while (id_s < id_e && static_cast<unsigned char>(*id_s - '0') <= 9) {
+                                    rec_id = rec_id * 10 + (*id_s - '0');
+                                    id_s++;
+                                }
+
+                                // name
+                                const char* name_ptr = "";
+                                uint32_t name_len = 0;
+                                if (name_s < name_e && *name_s == '"') {
+                                    const char* ns = name_s + 1;
+                                    const char* ne = (name_e > ns && name_e[-1] == '"') ? name_e - 1 : name_e;
+                                    if (ne > ns) {
+                                        const char* q = static_cast<const char*>(std::memchr(ns, '"', ne - ns));
+                                        if (!q) {
+                                            name_ptr = ns;
+                                            name_len = (uint32_t)(ne - ns);
+                                        } else {
+                                            char* dest = unescape_buf;
+                                            const char* np = ns;
+                                            while (np < ne) {
+                                                if (*np == '"' && np + 1 < ne && *(np + 1) == '"') {
+                                                    *dest++ = '"';
+                                                    np += 2;
+                                                } else {
+                                                    *dest++ = *np++;
+                                                }
+                                            }
+                                            name_ptr = unescape_buf;
+                                            name_len = (uint32_t)(dest - unescape_buf);
+                                        }
                                     }
                                 } else {
-                                    *dest++ = *p++;
+                                    name_ptr = name_s;
+                                    name_len = (uint32_t)(name_e - name_s);
                                 }
-                            }
-                            name_ptr = unescape_buf;
-                            name_len = (uint32_t)(dest - unescape_buf);
-                            if (p < limit && *p == ',') p++;
-                        }
-                    } else {
-                        const char* nstart = p;
-                        size_t scan_len = std::min<size_t>(limit - p, 64);
-                        const char* comma = static_cast<const char*>(std::memchr(p, ',', scan_len));
-                        if (comma) {
-                            name_ptr = nstart;
-                            name_len = (uint32_t)(comma - nstart);
-                            p = comma + 1;
-                        } else {
-                            break;
-                        }
-                    }
 
-                    uint64_t note_len = 0;
-                    if (p < limit && *p == '"') {
-                        p++;
-                        size_t scan_len = std::min<size_t>(limit - p, 96);
-                        const char* q = static_cast<const char*>(std::memchr(p, '"', scan_len));
-                        if (q && (q + 1 < limit && *(q + 1) == ',')) {
-                            note_len = (uint64_t)(q - p);
-                            p = q + 2;
-                        } else {
-                            while (p < limit) {
-                                if (*p == '"') {
-                                    if (p + 1 < limit && *(p + 1) == '"') {
-                                        note_len++;
-                                        p += 2;
-                                    } else {
-                                        p++;
-                                        break;
+                                // note
+                                uint64_t note_len = 0;
+                                if (note_s < note_e && *note_s == '"') {
+                                    const char* ns = note_s + 1;
+                                    const char* ne = (note_e > ns && note_e[-1] == '"') ? note_e - 1 : note_e;
+                                    if (ne > ns) {
+                                        uint64_t raw_len = (uint64_t)(ne - ns);
+                                        uint32_t q_cnt = 0;
+                                        for (const char* cp = ns; cp < ne; ++cp) {
+                                            if (*cp == '"') q_cnt++;
+                                        }
+                                        note_len = raw_len - (q_cnt / 2);
                                     }
                                 } else {
-                                    note_len++;
-                                    p++;
+                                    note_len = (uint64_t)(note_e - note_s);
+                                }
+
+                                // region_id
+                                uint32_t region_id = 0;
+                                while (reg_s < reg_e && static_cast<unsigned char>(*reg_s - '0') <= 9) {
+                                    region_id = region_id * 10 + (*reg_s - '0');
+                                    reg_s++;
+                                }
+
+                                // amount
+                                int64_t cents = parse_cents_fast(amt_s, amt_e);
+
+                                uint16_t cid = (region_id < 1000000) ? region_to_country[region_id] : 0xFFFF;
+                                if (cid == 0xFFFF) cid = unmatched_cid;
+
+                                auto& cs = stats[cid];
+                                cs.count++;
+                                cs.id_sum += rec_id;
+                                cs.amount_sum += cents;
+                                if (cents < cs.amount_min) cs.amount_min = cents;
+                                if (cents > cs.amount_max) cs.amount_max = cents;
+                                cs.name_bytes += name_len;
+                                cs.note_bytes += note_len;
+
+                                uint64_t nh = hash_bytes_fast(name_ptr, name_len);
+                                if (nh == 0) nh = 1;
+
+                                uint32_t nid = ncache.lookup(nh, name_len, [&]() {
+                                    return get_or_register_name_fast(name_ptr, name_len, nh);
+                                });
+
+                                size_t w_idx = (size_t)cid * BITSET_WORDS + (nid >> 6);
+                                uint64_t bit = 1ULL << (nid & 63);
+                                uint64_t old_val = global_seen[w_idx].load(std::memory_order_relaxed);
+                                if (!(old_val & bit)) {
+                                    global_seen[w_idx].fetch_or(bit, std::memory_order_relaxed);
                                 }
                             }
-                            if (p < limit && *p == ',') p++;
+
+                            cur_field_idx = 0;
+                            cur_field_start = sep_ptr + 1;
+                            if (cur_field_start + 3 <= data + total_size &&
+                                (uint8_t)cur_field_start[0] == 0xEF &&
+                                (uint8_t)cur_field_start[1] == 0xBB &&
+                                (uint8_t)cur_field_start[2] == 0xBF) {
+                                cur_field_start += 3;
+                            }
+                            if (cur_field_start >= limit) break;
                         }
-                    } else {
-                        const char* ntstart = p;
-                        size_t scan_len = std::min<size_t>(limit - p, 96);
-                        const char* comma = static_cast<const char*>(std::memchr(p, ',', scan_len));
-                        if (comma) {
-                            note_len = (uint64_t)(comma - ntstart);
-                            p = comma + 1;
-                        } else {
-                            break;
-                        }
                     }
-
-                    uint32_t region_id = 0;
-                    while (p < limit && static_cast<unsigned char>(*p - '0') <= 9) {
-                        region_id = region_id * 10 + (*p - '0');
-                        p++;
-                    }
-                    if (p < limit && *p == ',') p++;
-
-                    int64_t cents = parse_cents_fast(p, limit);
-
-                    if (p < limit && *p == '\r') p++;
-                    if (p < limit && *p == '\n') p++;
-
-                    uint16_t cid = (region_id < 1000000) ? region_to_country[region_id] : 0xFFFF;
-                    if (cid == 0xFFFF) cid = unmatched_cid;
-
-                    auto& cs = stats[cid];
-                    cs.count++;
-                    cs.id_sum += rec_id;
-                    cs.amount_sum += cents;
-                    if (cents < cs.amount_min) cs.amount_min = cents;
-                    if (cents > cs.amount_max) cs.amount_max = cents;
-                    cs.name_bytes += name_len;
-                    cs.note_bytes += note_len;
-
-                    uint64_t nh = hash_bytes_fast(name_ptr, name_len);
-                    if (nh == 0) nh = 1;
-
-                    uint32_t nid = ncache.lookup(nh, name_len, [&]() {
-                        return get_or_register_name_fast(name_ptr, name_len, nh);
-                    });
-
-                    size_t w_idx = (size_t)cid * BITSET_WORDS + (nid >> 6);
-                    uint64_t bit = 1ULL << (nid & 63);
-                    uint64_t old_val = global_seen[w_idx].load(std::memory_order_relaxed);
-                    if (!(old_val & bit)) {
-                        global_seen[w_idx].fetch_or(bit, std::memory_order_relaxed);
-                    }
+                    p += 64;
                 }
             }
         });
