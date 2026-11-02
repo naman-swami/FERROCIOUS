@@ -42,7 +42,7 @@
 namespace {
 
 constexpr unsigned kHours = 72;
-constexpr size_t kChunk = 128 * 1024;
+constexpr size_t kChunk = 1024 * 1024;
 constexpr uint32_t kBlock = 1024;   // records per bucket block (4 KB)
 constexpr size_t kWin = 16384;      // bytes indexed for newlines per window (stays in L1)
 constexpr unsigned kMaxThreads = 12;
@@ -328,14 +328,7 @@ inline char* put_u32(char* o, uint32_t v) {
     return o + (10 - i);
 }
 
-inline void sort_small(uint32_t* a, uint32_t n) {
-    if (n > 32) { std::sort(a, a + n); return; }
-    for (uint32_t i = 1; i < n; ++i) {
-        uint32_t v = a[i], j = i;
-        while (j > 0 && a[j - 1] > v) { a[j] = a[j - 1]; --j; }
-        a[j] = v;
-    }
-}
+
 
 char g_hour_str[kHours][24];
 std::vector<uint32_t> g_order;
@@ -363,8 +356,7 @@ void write_all(int fd, const char* b, size_t n) {
 }
 
 struct Scratch {
-    std::vector<uint32_t> cnt, err, pos, A, B, res;
-    uint32_t h1[1024], h2[512];
+    std::vector<uint32_t> cnt, err, pos, A, res;
 };
 
 template <class F>
@@ -382,27 +374,20 @@ inline void for_records(unsigned h, F&& f) {
 void process_hour(unsigned h, Scratch& sc) {
     const uint32_t G = (uint32_t)g_eps.size();
     if (sc.cnt.size() < G) { sc.cnt.resize(G); sc.err.resize(G); sc.pos.resize(G); sc.res.resize(3 * (size_t)G); }
-    if (sc.A.size() < g_max_hour_n) { sc.A.resize(g_max_hour_n); sc.B.resize(g_max_hour_n); }
+    if (sc.A.size() < g_max_hour_n) { sc.A.resize(g_max_hour_n); }
     uint32_t *cnt = sc.cnt.data(), *err = sc.err.data(), *pos = sc.pos.data();
-    uint32_t *A = sc.A.data(), *B = sc.B.data(), *h1 = sc.h1, *h2 = sc.h2;
+    uint32_t *A = sc.A.data();
     if (G) { memset(cnt, 0, G * 4); memset(err, 0, G * 4); }
-    const bool fast = g_spill_n[h] == 0;
 
-    if (fast) {
-        memset(h1, 0, sizeof sc.h1);
-        memset(h2, 0, sizeof sc.h2);
-        for_records(h, [&](uint32_t v) {
-            uint32_t g = v >> 20;
-            cnt[g]++;
-            err[g] += (v >> 19) & 1;
-            h1[v & 1023]++;
-            h2[(v >> 10) & 511]++;
-        });
-    } else {
-        for_records(h, [&](uint32_t v) { cnt[v >> 20]++; err[v >> 20] += (v >> 19) & 1; });
-        for (Worker& w : g_workers)
-            for (const Spill& s : w.spill)
-                if (s.hour == h) { cnt[s.gid]++; err[s.gid] += s.err; }
+    for_records(h, [&](uint32_t v) {
+        uint32_t g = v >> 20;
+        cnt[g]++;
+        err[g] += (v >> 19) & 1;
+    });
+    for (Worker& w : g_workers) {
+        for (const Spill& s : w.spill) {
+            if (s.hour == h) { cnt[s.gid]++; err[s.gid] += s.err; }
+        }
     }
 
     uint32_t run = 0;
@@ -412,22 +397,14 @@ void process_hour(unsigned h, Scratch& sc) {
         run += cnt[g];
         if (cnt[g]) cap += g_eps[g].size() + 96;
     }
-    const uint32_t N = run;
-    uint32_t lat_mask;
-    if (fast) {
-        uint32_t s1 = 0, s2 = 0;
-        for (int i = 0; i < 1024; ++i) { uint32_t t = h1[i]; h1[i] = s1; s1 += t; }
-        for (int i = 0; i < 512; ++i) { uint32_t t = h2[i]; h2[i] = s2; s2 += t; }
-        for_records(h, [&](uint32_t v) { A[h1[v & 1023]++] = v; });
-        for (uint32_t k = 0; k < N; ++k) { uint32_t v = A[k]; B[h2[(v >> 10) & 511]++] = v; }
-        for (uint32_t k = 0; k < N; ++k) { uint32_t v = B[k]; A[pos[v >> 20]++] = v; }
-        lat_mask = 0x7FFFF;
-    } else {
-        for_records(h, [&](uint32_t v) { A[pos[v >> 20]++] = v & 0x7FFFF; });
-        for (Worker& w : g_workers)
-            for (const Spill& s : w.spill)
-                if (s.hour == h) A[pos[s.gid]++] = s.lat;
-        lat_mask = ~0u;
+
+    for_records(h, [&](uint32_t v) {
+        A[pos[v >> 20]++] = v & 0x7FFFF;
+    });
+    for (Worker& w : g_workers) {
+        for (const Spill& s : w.spill) {
+            if (s.hour == h) A[pos[s.gid]++] = s.lat;
+        }
     }
 
     uint32_t* res = sc.res.data();
@@ -435,10 +412,20 @@ void process_hour(unsigned h, Scratch& sc) {
         uint32_t n = cnt[g];
         if (!n) continue;
         uint32_t* sl = A + (pos[g] - n);
-        if (!fast) sort_small(sl, n);
-        res[3 * g] = sl[(50ull * n + 99) / 100 - 1] & lat_mask;
-        res[3 * g + 1] = sl[(95ull * n + 99) / 100 - 1] & lat_mask;
-        res[3 * g + 2] = sl[(99ull * n + 99) / 100 - 1] & lat_mask;
+        uint32_t p50_idx = (50ull * n + 99) / 100 - 1;
+        uint32_t p95_idx = (95ull * n + 99) / 100 - 1;
+        uint32_t p99_idx = (99ull * n + 99) / 100 - 1;
+
+        if (n <= 64) {
+            std::sort(sl, sl + n);
+        } else {
+            std::nth_element(sl, sl + p99_idx, sl + n);
+            std::nth_element(sl, sl + p95_idx, sl + p99_idx);
+            std::nth_element(sl, sl + p50_idx, sl + p95_idx);
+        }
+        res[3 * g] = sl[p50_idx];
+        res[3 * g + 1] = sl[p95_idx];
+        res[3 * g + 2] = sl[p99_idx];
     }
 
     char* buf = (char*)malloc(cap);
