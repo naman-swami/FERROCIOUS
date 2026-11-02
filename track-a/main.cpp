@@ -342,10 +342,8 @@ std::vector<uint32_t> g_order;
 size_t g_max_hour_n = 0;
 size_t g_spill_n[kHours];
 
-struct HourOut { char* buf = nullptr; size_t len = 0; bool ready = false; };
+struct HourOut { char* buf = nullptr; size_t len = 0; };
 HourOut g_out[kHours];
-unsigned g_next_flush = 0;
-std::mutex g_out_mu;
 int g_out_fd = -1;
 
 void write_all(int fd, const char* b, size_t n) {
@@ -361,17 +359,6 @@ void write_all(int fd, const char* b, size_t n) {
         }
         b += w;
         n -= (size_t)w;
-    }
-}
-
-void publish(unsigned h, char* buf, size_t len) {
-    std::lock_guard<std::mutex> lk(g_out_mu);
-    g_out[h] = HourOut{buf, len, true};
-    while (g_next_flush < kHours && g_out[g_next_flush].ready) {
-        HourOut& o = g_out[g_next_flush++];
-        write_all(g_out_fd, o.buf, o.len);
-        free(o.buf);
-        o.buf = nullptr;
     }
 }
 
@@ -470,7 +457,7 @@ void process_hour(unsigned h, Scratch& sc) {
         o = put_u32(o, e);              *o++ = ' ';
         o = put_u32(o, (uint32_t)((uint64_t)e * 1000000ull / n)); *o++ = '\n';
     }
-    publish(h, buf, (size_t)(o - buf));
+    g_out[h] = HourOut{buf, (size_t)(o - buf)};
 }
 
 }  // namespace
@@ -570,6 +557,12 @@ int main(int argc, char** argv) {
     work(0);
     for (auto& th : pool) th.join();
 
+    for (unsigned h = 0; h < kHours; ++h) {
+        if (g_out[h].buf) {
+            write_all(g_out_fd, g_out[h].buf, g_out[h].len);
+        }
+    }
+
 #ifdef _WIN32
     if (g_out_fd >= 0) _close(g_out_fd);
     UnmapViewOfFile(data);
@@ -577,6 +570,7 @@ int main(int argc, char** argv) {
     CloseHandle(hFile);
 #else
     if (g_out_fd >= 0) close(g_out_fd);
+    _exit(0);
 #endif
     return 0;
 }

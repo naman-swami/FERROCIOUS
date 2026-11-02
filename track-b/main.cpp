@@ -798,5 +798,9 @@ int main(int argc, char* argv[]) {
     }
     fclose(fp);
 
+#ifndef _WIN32
+    _exit(0);
+#endif
+
     return 0;
 }

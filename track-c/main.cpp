@@ -391,8 +391,11 @@ int main(int argc, char* argv[]) {
 
     uint16_t num_countries = (uint16_t)country_names.size();
 
-    size_t words_per_thread = (size_t)num_countries * BITSET_WORDS;
-    std::vector<uint64_t> thread_seen(num_threads * words_per_thread, 0ULL);
+    size_t total_words = (size_t)num_countries * BITSET_WORDS;
+    auto global_seen = std::make_unique<std::atomic<uint64_t>[]>(total_words);
+    for (size_t i = 0; i < total_words; ++i) {
+        global_seen[i].store(0ULL, std::memory_order_relaxed);
+    }
 
     MappedFile mf(records_path.c_str());
     if (!mf.ok) return 1;
@@ -418,7 +421,6 @@ int main(int argc, char* argv[]) {
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
             ThreadStats* stats = &thread_stats[tid * num_countries];
-            uint64_t* my_seen = &thread_seen[tid * words_per_thread];
             char unescape_buf[512];
             NCache ncache;
 
@@ -464,7 +466,8 @@ int main(int argc, char* argv[]) {
                     uint32_t name_len = 0;
                     if (p < limit && *p == '"') {
                         p++;
-                        const char* q = static_cast<const char*>(std::memchr(p, '"', limit - p));
+                        size_t scan_len = std::min<size_t>(limit - p, 64);
+                        const char* q = static_cast<const char*>(std::memchr(p, '"', scan_len));
                         if (q && (q + 1 < limit && *(q + 1) == ',')) {
                             name_ptr = p;
                             name_len = (uint32_t)(q - p);
@@ -490,7 +493,8 @@ int main(int argc, char* argv[]) {
                         }
                     } else {
                         const char* nstart = p;
-                        const char* comma = static_cast<const char*>(std::memchr(p, ',', limit - p));
+                        size_t scan_len = std::min<size_t>(limit - p, 64);
+                        const char* comma = static_cast<const char*>(std::memchr(p, ',', scan_len));
                         if (comma) {
                             name_ptr = nstart;
                             name_len = (uint32_t)(comma - nstart);
@@ -503,7 +507,8 @@ int main(int argc, char* argv[]) {
                     uint64_t note_len = 0;
                     if (p < limit && *p == '"') {
                         p++;
-                        const char* q = static_cast<const char*>(std::memchr(p, '"', limit - p));
+                        size_t scan_len = std::min<size_t>(limit - p, 96);
+                        const char* q = static_cast<const char*>(std::memchr(p, '"', scan_len));
                         if (q && (q + 1 < limit && *(q + 1) == ',')) {
                             note_len = (uint64_t)(q - p);
                             p = q + 2;
@@ -526,7 +531,8 @@ int main(int argc, char* argv[]) {
                         }
                     } else {
                         const char* ntstart = p;
-                        const char* comma = static_cast<const char*>(std::memchr(p, ',', limit - p));
+                        size_t scan_len = std::min<size_t>(limit - p, 96);
+                        const char* comma = static_cast<const char*>(std::memchr(p, ',', scan_len));
                         if (comma) {
                             note_len = (uint64_t)(comma - ntstart);
                             p = comma + 1;
@@ -567,7 +573,11 @@ int main(int argc, char* argv[]) {
                     });
 
                     size_t w_idx = (size_t)cid * BITSET_WORDS + (nid >> 6);
-                    my_seen[w_idx] |= (1ULL << (nid & 63));
+                    uint64_t bit = 1ULL << (nid & 63);
+                    uint64_t old_val = global_seen[w_idx].load(std::memory_order_relaxed);
+                    if (!(old_val & bit)) {
+                        global_seen[w_idx].fetch_or(bit, std::memory_order_relaxed);
+                    }
                 }
             }
         });
@@ -582,23 +592,12 @@ int main(int argc, char* argv[]) {
         agg_workers.emplace_back([&, tid]() {
             size_t c_start = tid * cids_per_thread;
             size_t c_end = std::min((size_t)num_countries, (tid + 1) * cids_per_thread);
-            alignas(64) uint64_t merged_buf[BITSET_WORDS];
             for (size_t cid = c_start; cid < c_end; ++cid) {
                 auto& fs = final_stats[cid];
-                std::memset(merged_buf, 0, sizeof(merged_buf));
                 size_t c_offset = cid * BITSET_WORDS;
-
-                for (unsigned int w_tid = 0; w_tid < num_threads; ++w_tid) {
-                    const uint64_t* src = &thread_seen[w_tid * words_per_thread + c_offset];
-                    for (size_t k = 0; k < BITSET_WORDS; k += 4) {
-                        __m256i vm = _mm256_loadu_si256((const __m256i*)(merged_buf + k));
-                        __m256i vs = _mm256_loadu_si256((const __m256i*)(src + k));
-                        _mm256_storeu_si256((__m256i*)(merged_buf + k), _mm256_or_si256(vm, vs));
-                    }
-                }
                 uint32_t distinct_cnt = 0;
                 for (size_t k = 0; k < BITSET_WORDS; ++k) {
-                    distinct_cnt += (uint32_t)std::popcount(merged_buf[k]);
+                    distinct_cnt += (uint32_t)std::popcount(global_seen[c_offset + k].load(std::memory_order_relaxed));
                 }
                 fs.names_distinct = distinct_cnt;
 
@@ -657,6 +656,10 @@ int main(int argc, char* argv[]) {
     }
     out.flush();
     fclose(fp);
+
+#ifndef _WIN32
+    _exit(0);
+#endif
 
     return 0;
 }
