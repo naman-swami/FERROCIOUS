@@ -9,6 +9,7 @@
 #include <thread>
 #include <chrono>
 #include <array>
+#include <memory>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
@@ -27,19 +28,6 @@
 #endif
 
 namespace {
-
-struct OutBuf {
-    FILE* f;
-    std::vector<char> b;
-    size_t n = 0;
-    explicit OutBuf(FILE* f) : f(f), b(1 << 20) {}
-    ~OutBuf() { flush(); }
-    void flush() { if (n && f) { fwrite(b.data(), 1, n, f); n = 0; } }
-    inline void put(char c) { b[n++] = c; if (n == b.size()) flush(); }
-    inline void puts(const char* s, size_t len) {
-        for (size_t i = 0; i < len; ++i) put(s[i]);
-    }
-};
 
 struct MappedFile {
     void*    data = nullptr;
@@ -288,7 +276,7 @@ int main(int argc, char* argv[]) {
         const char* nl = static_cast<const char*>(std::memchr(qp, '\n', qend - qp));
         const char* line_end = nl ? nl : qend;
         size_t line_len = line_end - qp;
-        if (line_len > 0 && qp[line_len - 1] == '\r') line_len--;
+        while (line_len > 0 && (qp[line_len - 1] == '\r' || qp[line_len - 1] == ' ' || qp[line_len - 1] == '\t')) line_len--;
         std::string_view qline(qp, line_len);
         query_lines.push_back(qline);
 
@@ -342,14 +330,15 @@ int main(int argc, char* argv[]) {
     constexpr size_t MAX_DOCS = 262144;
     std::vector<DocSpan> doc_spans(MAX_DOCS);
 
-    std::vector<std::vector<uint32_t>> thread_counts(num_threads, std::vector<uint32_t>(num_active_tokens, 0));
+    // Flattened 1D thread_counts: num_threads * num_active_tokens
+    std::vector<uint32_t> thread_counts(num_threads * num_active_tokens, 0);
     std::vector<std::thread> workers;
 
     for (unsigned tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
             const char* cur = chunk_starts[tid];
             const char* limit = chunk_ends[tid];
-            auto& counts = thread_counts[tid];
+            uint32_t* counts = &thread_counts[tid * num_active_tokens];
             std::vector<uint32_t> last_doc_seen(num_active_tokens, 0xFFFFFFFFu);
 
             while (cur < limit) {
@@ -407,15 +396,16 @@ int main(int argc, char* argv[]) {
     workers.clear();
 
     std::vector<uint32_t> csr_offsets(num_active_tokens + 1, 0);
-    std::vector<std::vector<uint32_t>> thread_write_ptrs(num_threads, std::vector<uint32_t>(num_active_tokens, 0));
+    // Flattened 1D thread_write_ptrs: num_threads * num_active_tokens
+    std::vector<uint32_t> thread_write_ptrs(num_threads * num_active_tokens, 0);
 
     uint32_t running_total = 0;
     for (uint32_t tok_id = 0; tok_id < num_active_tokens; ++tok_id) {
         csr_offsets[tok_id] = running_total;
         uint32_t t_base = running_total;
         for (unsigned tid = 0; tid < num_threads; ++tid) {
-            thread_write_ptrs[tid][tok_id] = t_base;
-            t_base += thread_counts[tid][tok_id];
+            thread_write_ptrs[tid * num_active_tokens + tok_id] = t_base;
+            t_base += thread_counts[tid * num_active_tokens + tok_id];
         }
         running_total = t_base;
     }
@@ -429,7 +419,7 @@ int main(int argc, char* argv[]) {
 
     for (unsigned tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
-            auto& write_ptrs = thread_write_ptrs[tid];
+            uint32_t* write_ptrs = &thread_write_ptrs[tid * num_active_tokens];
             const char* cur = chunk_starts[tid];
             const char* limit = chunk_ends[tid];
             std::vector<uint32_t> last_doc_seen(num_active_tokens, 0xFFFFFFFFu);
@@ -489,16 +479,22 @@ int main(int argc, char* argv[]) {
     thread_write_ptrs.shrink_to_fit();
 
     std::vector<const uint64_t*> term_bitsets(num_active_tokens, nullptr);
-    std::vector<std::vector<uint64_t>> bitset_arena;
-    bitset_arena.reserve(1024);
+    size_t num_bitset_terms = 0;
+    for (uint32_t tok_id = 0; tok_id < num_active_tokens; ++tok_id) {
+        if (csr_offsets[tok_id + 1] - csr_offsets[tok_id] >= BITSET_FREQ_THRESHOLD) {
+            num_bitset_terms++;
+        }
+    }
+    // Flattened 1D bitset_arena
+    std::vector<uint64_t> bitset_arena(num_bitset_terms * BITSET_WORDS, 0ULL);
+    size_t cur_bitset_idx = 0;
 
     for (uint32_t tok_id = 0; tok_id < num_active_tokens; ++tok_id) {
         uint32_t start = csr_offsets[tok_id];
         uint32_t end = csr_offsets[tok_id + 1];
         uint32_t df = end - start;
         if (df >= BITSET_FREQ_THRESHOLD) {
-            bitset_arena.emplace_back(BITSET_WORDS, 0ULL);
-            uint64_t* bits = bitset_arena.back().data();
+            uint64_t* bits = bitset_arena.data() + cur_bitset_idx * BITSET_WORDS;
             const uint32_t* docs = csr_doc_ids.data() + start;
             for (uint32_t i = 0; i < df; ++i) {
                 uint32_t doc = docs[i];
@@ -507,6 +503,7 @@ int main(int argc, char* argv[]) {
             bits[3906] &= TAIL_MASK;
             bits[3907] = 0ULL;
             term_bitsets[tok_id] = bits;
+            cur_bitset_idx++;
         }
     }
 
@@ -523,8 +520,9 @@ int main(int argc, char* argv[]) {
             std::string& out_str = thread_outputs[tid];
             out_str.reserve(1024 * 1024);
 
-            std::vector<uint32_t> buf_a(262144);
-            std::vector<uint32_t> buf_b(262144);
+            // Raw unique_ptr buffers: bypass 24 MB of zero-fill memset
+            std::unique_ptr<uint32_t[]> buf_a(new uint32_t[262144]);
+            std::unique_ptr<uint32_t[]> buf_b(new uint32_t[262144]);
             std::vector<uint32_t> matches;
             matches.reserve(65536);
 
@@ -553,8 +551,8 @@ int main(int argc, char* argv[]) {
                     }
 
                     int64_t id0 = find_token(parts[0]);
-                    uint32_t* cur_buf = buf_a.data();
-                    uint32_t* next_buf = buf_b.data();
+                    uint32_t* cur_buf = buf_a.get();
+                    uint32_t* next_buf = buf_b.get();
                     size_t cur_len = 0;
 
                     if (id0 >= 0 && (size_t)id0 < num_active_tokens) {
@@ -584,6 +582,7 @@ int main(int argc, char* argv[]) {
                         }
 
                         size_t next_len = 0;
+
                         if (op == "AND") {
                             if (cur_len > 0 && post_len > 0) {
                                 if (post_bitset) {
@@ -593,10 +592,14 @@ int main(int argc, char* argv[]) {
                                             next_buf[next_len++] = doc;
                                         }
                                     }
-                                } else if (cur_len * 8 < post_len) {
-                                    next_len = intersect_small_large(cur_buf, cur_len, post_data, post_len, next_buf);
                                 } else {
-                                    next_len = setop<true, false, false>(cur_buf, cur_len, post_data, post_len, next_buf);
+                                    if (post_len * 8 < cur_len) {
+                                        next_len = intersect_small_large(post_data, post_len, cur_buf, cur_len, next_buf);
+                                    } else if (cur_len * 8 < post_len) {
+                                        next_len = intersect_small_large(cur_buf, cur_len, post_data, post_len, next_buf);
+                                    } else {
+                                        next_len = setop<true, false, false>(cur_buf, cur_len, post_data, post_len, next_buf);
+                                    }
                                 }
                             }
                             cur_len = next_len;
@@ -650,14 +653,14 @@ int main(int argc, char* argv[]) {
                     if (!inner.empty() && inner.back() == '"') inner.remove_suffix(1);
 
                     size_t num_phrase_terms = 0, pos = 0;
-                    size_t min_len = 0;
+                    size_t min_phrase_len = 0;
                     while (pos < inner.size() && num_phrase_terms < 32) {
                         while (pos < inner.size() && inner[pos] == ' ') pos++;
                         if (pos >= inner.size()) break;
                         size_t next_sp = inner.find(' ', pos);
                         if (next_sp == std::string_view::npos) next_sp = inner.size();
                         std::string_view w = inner.substr(pos, next_sp - pos);
-                        min_len += w.size();
+                        min_phrase_len += w.size();
                         phrase_terms[num_phrase_terms++] = w;
                         pos = next_sp;
                     }
@@ -682,7 +685,8 @@ int main(int argc, char* argv[]) {
                             break;
                         }
                         uint32_t start = csr_offsets[tid_val];
-                        uint32_t plen = csr_offsets[tid_val + 1] - start;
+                        uint32_t end = csr_offsets[tid_val + 1];
+                        uint32_t plen = end - start;
                         if (plen == 0) {
                             missing = true;
                             break;
@@ -707,8 +711,8 @@ int main(int argc, char* argv[]) {
                         return a.len < b.len;
                     });
 
-                    uint32_t* cur_cand = buf_a.data();
-                    uint32_t* next_cand = buf_b.data();
+                    uint32_t* cur_cand = buf_a.get();
+                    uint32_t* next_cand = buf_b.get();
 
                     uint32_t first_tok_id = pinfo[0].tok_id;
                     uint32_t f_start = csr_offsets[first_tok_id];
@@ -749,7 +753,7 @@ int main(int argc, char* argv[]) {
                         uint32_t doc_id = cur_cand[k];
                         if (doc_id < MAX_DOCS) {
                             const auto& span = doc_spans[doc_id];
-                            if (span.len >= min_len) {
+                            if (span.len >= min_phrase_len) {
                                 const char* s = docs_data + span.off;
                                 const char* e = s + span.len;
                                 if (match_phrase_kmp_fast(s, e, phrase_terms, pi, k_lim)) {
@@ -781,18 +785,17 @@ int main(int argc, char* argv[]) {
 
     for (auto& w : workers) w.join();
 
-    #ifdef _WIN32
+#ifdef _WIN32
     CreateDirectoryA(out_dir.c_str(), NULL);
-    #endif
+#endif
 
     FILE* fp = fopen(results_path.c_str(), "wb");
     if (!fp) return 1;
 
-    OutBuf out(fp);
+    // Discarded OutBuf: direct fwrite per thread output
     for (unsigned tid = 0; tid < num_threads; ++tid) {
-        out.puts(thread_outputs[tid].data(), thread_outputs[tid].size());
+        fwrite(thread_outputs[tid].data(), 1, thread_outputs[tid].size(), fp);
     }
-    out.flush();
     fclose(fp);
 
     return 0;
