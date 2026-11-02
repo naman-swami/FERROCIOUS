@@ -191,7 +191,7 @@ int main(int argc, char* argv[]) {
 
     unsigned num_threads = std::thread::hardware_concurrency();
     if (!num_threads) num_threads = 6;
-    // no 12-thread clamp
+    num_threads = std::min(num_threads, 12u);
 
     std::vector<std::string_view> query_lines;
     query_lines.reserve(65536);
@@ -283,9 +283,9 @@ int main(int argc, char* argv[]) {
             const char* limit = chunk_ends[tid];
             uint32_t* counts = &thread_counts[tid * num_active_tokens];
             auto& t_toks = thread_tokens[tid];
-            t_toks.reserve(2 * 1024 * 1024);
+            t_toks.reserve(1900000);
             auto& t_docs = thread_docs[tid];
-            t_docs.reserve(32768);
+            t_docs.reserve(24000);
             std::vector<uint32_t> last_doc(num_active_tokens, 0xFFFFFFFFu);
 
             while (cur < limit) {

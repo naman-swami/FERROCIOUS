@@ -161,7 +161,7 @@ inline uint32_t get_or_register_name_fast(const char* s, size_t len, uint64_t h)
 }
 
 struct NCache {
-    static constexpr unsigned N = 2048, M = N - 1;
+    static constexpr unsigned N = 16384, M = N - 1;
     uint64_t h[N]{};
     uint32_t len[N]{}, id[N]{};
     template <class F>
@@ -197,6 +197,7 @@ int main(int argc, char* argv[]) {
 
     unsigned int num_threads = std::thread::hardware_concurrency();
     if (!num_threads) num_threads = 6;
+    num_threads = std::min(num_threads, 12u);
 
     {
         MappedFile rmf((data_dir + "/regions.csv").c_str());
