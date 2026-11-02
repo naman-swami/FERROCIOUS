@@ -248,43 +248,6 @@ struct ThreadStats {
 
 static constexpr size_t BITSET_WORDS = 2048;
 
-struct ThreadSafeCountryMap {
-    struct Slot {
-        std::atomic<uint32_t> code{0};
-        uint16_t cid = 0xFFFF;
-    };
-    Slot table[1024];
-    std::mutex mtx;
-
-    ThreadSafeCountryMap() {
-        for (size_t i = 0; i < 1024; ++i) {
-            table[i].code.store(0, std::memory_order_relaxed);
-            table[i].cid = 0xFFFF;
-        }
-    }
-
-    uint16_t get_or_insert(uint32_t code, const char* str_ptr, size_t clen, std::vector<std::string>& country_names) {
-        size_t idx = (code * 0x9E3779B9u) & 1023;
-        while (true) {
-            uint32_t c = table[idx].code.load(std::memory_order_acquire);
-            if (c == code) return table[idx].cid;
-            if (c == 0) {
-                std::lock_guard<std::mutex> lock(mtx);
-                c = table[idx].code.load(std::memory_order_relaxed);
-                if (c == code) return table[idx].cid;
-                if (c == 0) {
-                    uint16_t cid = (uint16_t)country_names.size();
-                    country_names.push_back(std::string(str_ptr, clen));
-                    table[idx].cid = cid;
-                    table[idx].code.store(code, std::memory_order_release);
-                    return cid;
-                }
-            }
-            idx = (idx + 1) & 1023;
-        }
-    }
-};
-
 static uint16_t region_to_country[1000000];
 
 } // namespace
@@ -321,69 +284,42 @@ int main(int argc, char* argv[]) {
         const char* r_nl = static_cast<const char*>(std::memchr(rdata + r_start, '\n', rsize - r_start));
         if (r_nl) r_start = (r_nl - rdata) + 1;
 
-        ThreadSafeCountryMap cmap;
-        constexpr size_t R_CHUNK_SIZE = 64 * 1024;
-        size_t num_r_chunks = (rsize - r_start + R_CHUNK_SIZE - 1) / R_CHUNK_SIZE;
-        std::atomic<uint32_t> next_r_chunk{0};
+        struct CSlot { uint32_t code = 0; uint16_t cid = 0xFFFF; };
+        CSlot ctable[1024] = {};
+        const char* p = rdata + r_start;
+        const char* limit = rdata + rsize;
 
-        std::vector<std::thread> r_workers;
-        for (unsigned int tid = 0; tid < num_threads; ++tid) {
-            r_workers.emplace_back([&]() {
-                while (true) {
-                    uint32_t c = next_r_chunk.fetch_add(1, std::memory_order_relaxed);
-                    if (c >= num_r_chunks) break;
+        while (p < limit) {
+            if (*p == '\r' || *p == '\n') { p++; continue; }
 
-                    size_t start = r_start + (size_t)c * R_CHUNK_SIZE;
-                    size_t end = std::min(r_start + ((size_t)c + 1) * R_CHUNK_SIZE, rsize);
+            uint32_t rid = 0;
+            while (p < limit && static_cast<unsigned char>(*p - '0') <= 9) {
+                rid = rid * 10 + (*p - '0');
+                p++;
+            }
+            if (p < limit && *p == ',') p++;
 
-                    if (c > 0) {
-                        while (start + 1 < rsize && !(rdata[start] == '\r' && rdata[start + 1] == '\n')) start++;
-                        if (start + 1 < rsize) start += 2;
-                    }
-                    if (c + 1 < num_r_chunks) {
-                        while (end + 1 < rsize && !(rdata[end] == '\r' && rdata[end + 1] == '\n')) end++;
-                        if (end + 1 < rsize) end += 2;
-                    }
+            const char* cstart = p;
+            while (p < limit && *p != '\r' && *p != '\n') p++;
+            size_t clen = p - cstart;
 
-                    const char* p = rdata + start;
-                    const char* limit = rdata + end;
+            uint32_t code = 0;
+            for (size_t i = 0; i < clen && i < 4; ++i) code |= ((uint8_t)cstart[i] << (i * 8));
 
-                    while (p < limit) {
-                        if (p >= limit || *p == '\r' || *p == '\n') {
-                            if (p < limit) p++;
-                            continue;
-                        }
+            size_t idx = (code * 0x9E3779B9u) & 1023;
+            while (ctable[idx].code != 0 && ctable[idx].code != code) idx = (idx + 1) & 1023;
+            uint16_t cid = ctable[idx].cid;
+            if (cid == 0xFFFF) {
+                cid = (uint16_t)country_names.size();
+                country_names.push_back(std::string(cstart, clen));
+                ctable[idx].code = code;
+                ctable[idx].cid = cid;
+            }
+            if (rid < 1000000) region_to_country[rid] = cid;
 
-                        uint32_t rid = 0;
-                        while (p < limit && static_cast<unsigned char>(*p - '0') <= 9) {
-                            rid = rid * 10 + (*p - '0');
-                            p++;
-                        }
-                        if (p < limit && *p == ',') p++;
-
-                        const char* cstart = p;
-                        while (p < limit && *p != '\r' && *p != '\n') p++;
-                        size_t clen = p - cstart;
-
-                        uint32_t code = 0;
-                        if (clen == 2) {
-                            code = (uint8_t)cstart[0] | ((uint8_t)cstart[1] << 8);
-                        } else if (clen == 3) {
-                            code = (uint8_t)cstart[0] | ((uint8_t)cstart[1] << 8) | ((uint8_t)cstart[2] << 16);
-                        } else {
-                            for (size_t i = 0; i < clen && i < 4; ++i) code |= ((uint8_t)cstart[i] << (i * 8));
-                        }
-
-                        uint16_t cid = cmap.get_or_insert(code, cstart, clen, country_names);
-                        if (rid < 1000000) region_to_country[rid] = cid;
-
-                        if (p < limit && *p == '\r') p++;
-                        if (p < limit && *p == '\n') p++;
-                    }
-                }
-            });
+            if (p < limit && *p == '\r') p++;
+            if (p < limit && *p == '\n') p++;
         }
-        for (auto& w : r_workers) w.join();
 
         unmatched_cid = (uint16_t)country_names.size();
         country_names.push_back("_UNMATCHED");
