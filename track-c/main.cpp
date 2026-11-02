@@ -1,5 +1,4 @@
 #include <iostream>
-#include <fstream>
 #include <vector>
 #include <string>
 #include <string_view>
@@ -8,9 +7,7 @@
 #include <algorithm>
 #include <thread>
 #include <atomic>
-#include <bit>
 #include <memory>
-#include <chrono>
 #include <immintrin.h>
 
 #ifdef _WIN32
@@ -48,8 +45,8 @@ struct MappedFile {
     bool   ok   = false;
 #ifdef _WIN32
     HANDLE hFile = INVALID_HANDLE_VALUE, hMap = NULL;
-    explicit MappedFile(const char* path) {
-        hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    explicit MappedFile(const char* p) {
+        hFile = CreateFileA(p, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
         if (hFile == INVALID_HANDLE_VALUE) return;
         LARGE_INTEGER li;
         if (!GetFileSizeEx(hFile, &li)) { CloseHandle(hFile); return; }
@@ -65,8 +62,8 @@ struct MappedFile {
         if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
     }
 #else
-    explicit MappedFile(const char* path) {
-        int fd = ::open(path, O_RDONLY);
+    explicit MappedFile(const char* p) {
+        int fd = ::open(p, O_RDONLY);
         if (fd < 0) return;
         struct stat st;
         if (::fstat(fd, &st) != 0) { ::close(fd); return; }
@@ -174,11 +171,6 @@ struct NCache {
     }
 };
 
-struct ThreadStats {
-    uint64_t count = 0, name_bytes = 0, note_bytes = 0;
-    int64_t id_sum = 0, amount_sum = 0, amount_min = INT64_MAX, amount_max = INT64_MIN;
-};
-
 static constexpr size_t BITSET_WORDS = 2048;
 static uint16_t region_to_country[1000000];
 
@@ -256,12 +248,12 @@ int main(int argc, char* argv[]) {
     constexpr size_t CHUNK_SIZE = 256 * 1024;
     size_t num_chunks = (total_size - data_start + CHUNK_SIZE - 1) / CHUNK_SIZE;
     std::atomic<uint32_t> next_chunk{0};
-    std::vector<ThreadStats> thread_stats(num_threads * num_countries);
+    std::vector<CountryStats> thread_stats(num_threads * num_countries);
 
     std::vector<std::thread> workers;
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
-            ThreadStats* stats = &thread_stats[tid * num_countries];
+            CountryStats* stats = &thread_stats[tid * num_countries];
             char unescape_buf[512];
             NCache ncache;
 
@@ -420,20 +412,23 @@ int main(int argc, char* argv[]) {
 
     std::vector<CountryStats> final_stats(num_countries);
     std::vector<std::thread> agg_workers;
-    size_t cids_per_thread = (num_countries + num_threads - 1) / num_threads;
+    size_t c_per_th = (num_countries + num_threads - 1) / num_threads;
+
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         agg_workers.emplace_back([&, tid]() {
-            size_t c_start = tid * cids_per_thread;
-            size_t c_end = std::min((size_t)num_countries, (tid + 1) * cids_per_thread);
+            size_t c_start = tid * c_per_th;
+            size_t c_end = std::min((size_t)num_countries, (tid + 1) * c_per_th);
             for (size_t cid = c_start; cid < c_end; ++cid) {
                 auto& fs = final_stats[cid];
-                size_t c_offset = cid * BITSET_WORDS;
                 uint32_t distinct_cnt = 0;
-                for (size_t k = 0; k < BITSET_WORDS; ++k) distinct_cnt += (uint32_t)std::popcount(global_seen[c_offset + k].load(std::memory_order_relaxed));
+                size_t base_idx = cid * BITSET_WORDS;
+                for (size_t w = 0; w < BITSET_WORDS; ++w) {
+                    uint64_t v = global_seen[base_idx + w].load(std::memory_order_relaxed);
+                    distinct_cnt += (uint32_t)std::popcount(v);
+                }
                 fs.names_distinct = distinct_cnt;
-
-                for (unsigned int w_tid = 0; w_tid < num_threads; ++w_tid) {
-                    const auto& ts = thread_stats[w_tid * num_countries + cid];
+                for (unsigned int t = 0; t < num_threads; ++t) {
+                    const auto& ts = thread_stats[t * num_countries + cid];
                     fs.count += ts.count;
                     fs.id_sum += ts.id_sum;
                     fs.amount_sum += ts.amount_sum;

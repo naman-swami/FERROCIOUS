@@ -31,6 +31,25 @@
 
 namespace {
 
+static constexpr auto BIT_SUM_16 = [] {
+    std::array<uint16_t, 65536> a{};
+    for (uint32_t x = 0; x < 65536; ++x) {
+        uint32_t s = 0;
+        for (uint32_t b = 0; b < 16; ++b) if ((x >> b) & 1) s += b;
+        a[x] = (uint16_t)s;
+    }
+    return a;
+}();
+
+inline uint32_t word_bit_sum(uint64_t w) {
+    uint32_t s0 = BIT_SUM_16[(uint16_t)w];
+    uint32_t s1 = BIT_SUM_16[(uint16_t)(w >> 16)] + 16 * (uint32_t)std::popcount((uint32_t)((w >> 16) & 0xFFFF));
+    uint32_t s2 = BIT_SUM_16[(uint16_t)(w >> 32)] + 32 * (uint32_t)std::popcount((uint32_t)((w >> 32) & 0xFFFF));
+    uint32_t s3 = BIT_SUM_16[(uint16_t)(w >> 48)] + 48 * (uint32_t)std::popcount((uint32_t)(w >> 48));
+    return s0 + s1 + s2 + s3;
+}
+
+
 struct MappedFile {
     void*  data = nullptr;
     size_t size = 0;
@@ -578,14 +597,20 @@ int main(int argc, char* argv[]) {
                         for (size_t w = 0; w < BITSET_WORDS; ++w) {
                             uint64_t word = dense_buf[w];
                             if (!word) continue;
-                            total_matches += (uint32_t)std::popcount(word);
                             uint32_t base_id = (uint32_t)w << 6;
-                            while (word) {
-                                uint32_t b = (uint32_t)__builtin_ctzll(word);
-                                uint32_t doc_id = base_id + b;
-                                sum_ids += doc_id;
-                                if (first10_count < 10) first10[first10_count++] = doc_id;
-                                word &= word - 1;
+                            uint32_t cnt = (uint32_t)std::popcount(word);
+                            total_matches += cnt;
+                            if (first10_count < 10) {
+                                uint64_t tmp = word;
+                                while (tmp) {
+                                    uint32_t b = (uint32_t)__builtin_ctzll(tmp);
+                                    uint32_t doc_id = base_id + b;
+                                    sum_ids += doc_id;
+                                    if (first10_count < 10) first10[first10_count++] = doc_id;
+                                    tmp &= tmp - 1;
+                                }
+                            } else {
+                                sum_ids += (uint64_t)base_id * cnt + word_bit_sum(word);
                             }
                         }
                         if (!total_matches) { out_str.append("0 0\n"); }
