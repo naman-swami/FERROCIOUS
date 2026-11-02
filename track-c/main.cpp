@@ -222,7 +222,7 @@ inline uint32_t get_or_register_name_fast(const char* s, size_t len, uint64_t h)
 }
 
 struct NCache {
-    static constexpr unsigned N = 1024, M = N - 1;
+    static constexpr unsigned N = 2048, M = N - 1;
     uint64_t h[N]{};
     uint32_t len[N]{}, id[N]{};
 
@@ -391,8 +391,8 @@ int main(int argc, char* argv[]) {
 
     uint16_t num_countries = (uint16_t)country_names.size();
 
-    size_t total_words = (size_t)num_countries * BITSET_WORDS;
-    auto global_seen = std::make_unique<std::atomic<uint64_t>[]>(total_words);
+    size_t words_per_thread = (size_t)num_countries * BITSET_WORDS;
+    std::vector<uint64_t> thread_seen(num_threads * words_per_thread, 0ULL);
 
     MappedFile mf(records_path.c_str());
     if (!mf.ok) return 1;
@@ -411,12 +411,14 @@ int main(int argc, char* argv[]) {
     size_t num_chunks = (total_size - data_start + CHUNK_SIZE - 1) / CHUNK_SIZE;
     std::atomic<uint32_t> next_chunk{0};
 
-    std::vector<std::vector<ThreadStats>> thread_stats(num_threads, std::vector<ThreadStats>(num_countries));
+    // Flattened 1D thread_stats: num_threads * num_countries
+    std::vector<ThreadStats> thread_stats(num_threads * num_countries);
 
     std::vector<std::thread> workers;
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
-            auto& stats = thread_stats[tid];
+            ThreadStats* stats = &thread_stats[tid * num_countries];
+            uint64_t* my_seen = &thread_seen[tid * words_per_thread];
             char unescape_buf[512];
             NCache ncache;
 
@@ -565,11 +567,7 @@ int main(int argc, char* argv[]) {
                     });
 
                     size_t w_idx = (size_t)cid * BITSET_WORDS + (nid >> 6);
-                    uint64_t bit = 1ULL << (nid & 63);
-                    uint64_t old_val = global_seen[w_idx].load(std::memory_order_relaxed);
-                    if ((old_val & bit) == 0) {
-                        global_seen[w_idx].fetch_or(bit, std::memory_order_relaxed);
-                    }
+                    my_seen[w_idx] |= (1ULL << (nid & 63));
                 }
             }
         });
@@ -578,27 +576,46 @@ int main(int argc, char* argv[]) {
     for (auto& w : workers) w.join();
 
     std::vector<CountryStats> final_stats(num_countries);
-    for (uint16_t cid = 0; cid < num_countries; ++cid) {
-        auto& fs = final_stats[cid];
-        uint32_t distinct_cnt = 0;
-        size_t base_idx = (size_t)cid * BITSET_WORDS;
+    std::vector<std::thread> agg_workers;
+    size_t cids_per_thread = (num_countries + num_threads - 1) / num_threads;
+    for (unsigned int tid = 0; tid < num_threads; ++tid) {
+        agg_workers.emplace_back([&, tid]() {
+            size_t c_start = tid * cids_per_thread;
+            size_t c_end = std::min((size_t)num_countries, (tid + 1) * cids_per_thread);
+            alignas(64) uint64_t merged_buf[BITSET_WORDS];
+            for (size_t cid = c_start; cid < c_end; ++cid) {
+                auto& fs = final_stats[cid];
+                std::memset(merged_buf, 0, sizeof(merged_buf));
+                size_t c_offset = cid * BITSET_WORDS;
 
-        for (size_t k = 0; k < BITSET_WORDS; ++k) {
-            distinct_cnt += (uint32_t)std::popcount(global_seen[base_idx + k].load(std::memory_order_relaxed));
-        }
-        fs.names_distinct = distinct_cnt;
+                for (unsigned int w_tid = 0; w_tid < num_threads; ++w_tid) {
+                    const uint64_t* src = &thread_seen[w_tid * words_per_thread + c_offset];
+                    for (size_t k = 0; k < BITSET_WORDS; k += 4) {
+                        __m256i vm = _mm256_loadu_si256((const __m256i*)(merged_buf + k));
+                        __m256i vs = _mm256_loadu_si256((const __m256i*)(src + k));
+                        _mm256_storeu_si256((__m256i*)(merged_buf + k), _mm256_or_si256(vm, vs));
+                    }
+                }
+                uint32_t distinct_cnt = 0;
+                for (size_t k = 0; k < BITSET_WORDS; ++k) {
+                    distinct_cnt += (uint32_t)std::popcount(merged_buf[k]);
+                }
+                fs.names_distinct = distinct_cnt;
 
-        for (unsigned int tid = 0; tid < num_threads; ++tid) {
-            const auto& ts = thread_stats[tid][cid];
-            fs.count += ts.count;
-            fs.id_sum += ts.id_sum;
-            fs.amount_sum += ts.amount_sum;
-            if (ts.amount_min < fs.amount_min) fs.amount_min = ts.amount_min;
-            if (ts.amount_max > fs.amount_max) fs.amount_max = ts.amount_max;
-            fs.name_bytes += ts.name_bytes;
-            fs.note_bytes += ts.note_bytes;
-        }
+                for (unsigned int w_tid = 0; w_tid < num_threads; ++w_tid) {
+                    const auto& ts = thread_stats[w_tid * num_countries + cid];
+                    fs.count += ts.count;
+                    fs.id_sum += ts.id_sum;
+                    fs.amount_sum += ts.amount_sum;
+                    if (ts.amount_min < fs.amount_min) fs.amount_min = ts.amount_min;
+                    if (ts.amount_max > fs.amount_max) fs.amount_max = ts.amount_max;
+                    fs.name_bytes += ts.name_bytes;
+                    fs.note_bytes += ts.note_bytes;
+                }
+            }
+        });
     }
+    for (auto& w : agg_workers) w.join();
 
 #ifdef _WIN32
     CreateDirectoryA(out_dir.c_str(), NULL);
