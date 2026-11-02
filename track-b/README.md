@@ -4,19 +4,22 @@ The task, the input files and the exact output format are in the [spec](https://
 
 ## Approach
 
-FERROCIOUS evaluates 50,000 boolean and exact phrase queries over the text corpus:
-- Two-phase query-driven pipeline: reads `queries.txt` first to extract the active query vocabulary, filtering out unneeded terms.
-- Single-pass memory-mapped tokenization with ASCII fast lowercasing and maximal runs of `[a-z0-9]`.
-- Compact inverted index storing sorted document ID postings and positional delta offsets.
-- Fast left-associative boolean evaluation for `AND`, `OR`, and binary set difference (`NOT`).
-- Consecutive positional matching for `PHRASE` queries.
-- Top-10 smallest document ID selection with 64-bit integer sum accumulators.
+FERROCIOUS answers 50,000 boolean and exact phrase queries over the corpus:
+- It reads `queries.txt` first and indexes only the terms the queries use.
+- Two passes over the memory-mapped corpus, split at line boundaries across threads. Pass 1 counts the document frequency of every query term. Pass 2 writes the sorted doc ids of every term into one flat CSR array.
+- Tokenization is byte-based ([a-z0-9] runs, ASCII lowercase). Token boundaries come from AVX2 bitmasks, and each token is looked up in a flat open-addressing table. Lookups are prefetched 16 tokens ahead.
+- Terms in many documents also get a bitset, so AND and NOT against them cost one probe per surviving candidate.
+- BOOL queries run strictly left to right on sorted lists. Short lists gallop into long ones; the others merge. The first operand is read in place.
+- PHRASE queries intersect the term lists rarest-first, then re-scan each surviving candidate line and match the phrase with KMP.
+- Output is the count, the exact 64-bit sum of ids and the ten smallest ids.
+- No positional index is stored: phrases are verified on the text.
 
 ## Dependencies
 
-None ($D = 1.00$). Standard C++20 library only.
+None ($D = 1.00$). Standard C++20 library and AVX2 intrinsics only.
 
 ## With another 24 hours
 
-- Implement Roaring Bitmap / AVX2 bitset intersections for dense boolean posting lists.
-- Galloping search (exponential search) for unbalanced posting list intersections.
+- Segment-copy unions and differences when one list is much shorter than the other.
+- Store byte offsets for rare terms so phrases can be verified without re-scanning the whole line.
+- Roaring-style containers instead of one bitset size for all frequent terms.
