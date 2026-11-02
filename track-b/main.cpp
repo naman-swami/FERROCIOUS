@@ -265,89 +265,83 @@ int main(int argc, char* argv[]) {
     constexpr size_t MAX_DOCS = 262144;
     std::vector<DocSpan> doc_spans(MAX_DOCS);
     std::vector<uint32_t> thread_counts(num_threads * num_active_tokens, 0);
+
+    // Single-pass text tokenization: cache intermediate tokens per thread
+    struct ThreadDocEntry { uint32_t doc_id, tok_start, tok_count; };
+    std::vector<std::vector<uint32_t>> thread_tokens(num_threads);
+    std::vector<std::vector<ThreadDocEntry>> thread_docs(num_threads);
     std::vector<std::thread> workers;
 
-    // DRY Unified chunk parser lambda
-    std::vector<uint32_t> csr_offsets, thread_write_ptrs, csr_doc_ids, token_df(num_active_tokens, 0);
-    std::vector<uint64_t> bitset_arena;
-    std::vector<uint64_t*> term_bitsets(num_active_tokens, nullptr);
+    for (unsigned tid = 0; tid < num_threads; ++tid) {
+        workers.emplace_back([&, tid]() {
+            const char* cur = chunk_starts[tid];
+            const char* limit = chunk_ends[tid];
+            uint32_t* counts = &thread_counts[tid * num_active_tokens];
+            auto& t_toks = thread_tokens[tid];
+            t_toks.reserve(2 * 1024 * 1024);
+            auto& t_docs = thread_docs[tid];
+            t_docs.reserve(32768);
+            std::vector<uint32_t> last_doc(num_active_tokens, 0xFFFFFFFFu);
 
-    auto run_pass = [&](bool is_pass_2) {
-        for (unsigned tid = 0; tid < num_threads; ++tid) {
-            workers.emplace_back([&, tid]() {
-                const char* cur = chunk_starts[tid];
-                const char* limit = chunk_ends[tid];
-                uint32_t* counts = is_pass_2 ? nullptr : &thread_counts[tid * num_active_tokens];
-                uint32_t* write_ptrs = is_pass_2 ? &thread_write_ptrs[tid * num_active_tokens] : nullptr;
-                std::vector<uint32_t> last_doc(num_active_tokens, 0xFFFFFFFFu);
+            while (cur < limit) {
+                uint32_t cur_doc_id = 0;
+                while (cur < limit && static_cast<unsigned char>(*cur - '0') <= 9) {
+                    cur_doc_id = cur_doc_id * 10 + (*cur - '0');
+                    cur++;
+                }
+                if (cur < limit && *cur == '\t') cur++;
+                if (cur >= limit) break;
 
-                while (cur < limit) {
-                    uint32_t cur_doc_id = 0;
-                    while (cur < limit && static_cast<unsigned char>(*cur - '0') <= 9) {
-                        cur_doc_id = cur_doc_id * 10 + (*cur - '0');
-                        cur++;
-                    }
-                    if (cur < limit && *cur == '\t') cur++;
-                    if (cur >= limit) break;
+                const char* text_start = cur;
+                const char* nl = (const char*)std::memchr(cur, '\n', limit - cur);
+                const char* line_end = nl ? nl : limit;
+                cur = nl ? nl + 1 : limit;
 
-                    const char* text_start = cur;
-                    const char* nl = (const char*)std::memchr(cur, '\n', limit - cur);
-                    const char* line_end = nl ? nl : limit;
-                    cur = nl ? nl + 1 : limit;
+                const char* text_end = line_end;
+                while (text_end > text_start && (text_end[-1] == '\r' || text_end[-1] == ' ' || text_end[-1] == '\t')) text_end--;
 
-                    const char* text_end = line_end;
-                    while (text_end > text_start && (text_end[-1] == '\r' || text_end[-1] == ' ' || text_end[-1] == '\t')) text_end--;
+                if (cur_doc_id < MAX_DOCS) {
+                    doc_spans[cur_doc_id] = {(uint32_t)(text_start - docs_data), (uint32_t)(text_end - text_start)};
+                }
 
-                    if (!is_pass_2 && cur_doc_id < MAX_DOCS) {
-                        doc_spans[cur_doc_id] = {(uint32_t)(text_start - docs_data), (uint32_t)(text_end - text_start)};
-                    }
-
-                    const char* p = text_start;
+                uint32_t tok_start = (uint32_t)t_toks.size();
+                const char* p = text_start;
+                while (p < text_end) {
+                    while (p < text_end && !TOKEN_CHAR[(uint8_t)*p]) p++;
+                    if (p >= text_end) break;
+                    uint64_t h = 0xcbf29ce484222325ULL;
                     while (p < text_end) {
-                        while (p < text_end && !TOKEN_CHAR[(uint8_t)*p]) p++;
-                        if (p >= text_end) break;
-                        uint64_t h = 0xcbf29ce484222325ULL;
-                        while (p < text_end) {
-                            uint8_t tc = TOKEN_CHAR[(uint8_t)*p];
-                            if (!tc) break;
-                            h = (h ^ tc) * 0x100000001b3ULL;
-                            p++;
-                        }
-                        if (!h) h = 1;
-                        if (!bloom_test(h)) continue;
+                        uint8_t tc = TOKEN_CHAR[(uint8_t)*p];
+                        if (!tc) break;
+                        h = (h ^ tc) * 0x100000001b3ULL;
+                        p++;
+                    }
+                    if (!h) h = 1;
+                    if (!bloom_test(h)) continue;
 
-                        size_t slot = h & VOCAB_MASK;
-                        while (vocab_table[slot].hash) {
-                            if (vocab_table[slot].hash == h) {
-                                uint32_t tok_id = vocab_table[slot].token_id;
-                                if (last_doc[tok_id] != cur_doc_id) {
-                                    last_doc[tok_id] = cur_doc_id;
-                                    if (!is_pass_2) {
-                                        counts[tok_id]++;
-                                    } else {
-                                        uint64_t* bset = term_bitsets[tok_id];
-                                        if (bset) {
-                                            reinterpret_cast<std::atomic<uint64_t>*>(bset)[cur_doc_id >> 6].fetch_or(1ULL << (cur_doc_id & 63), std::memory_order_relaxed);
-                                        } else {
-                                            csr_doc_ids[write_ptrs[tok_id]++] = cur_doc_id;
-                                        }
-                                    }
-                                }
-                                break;
+                    size_t slot = h & VOCAB_MASK;
+                    while (vocab_table[slot].hash) {
+                        if (vocab_table[slot].hash == h) {
+                            uint32_t tok_id = vocab_table[slot].token_id;
+                            if (last_doc[tok_id] != cur_doc_id) {
+                                last_doc[tok_id] = cur_doc_id;
+                                counts[tok_id]++;
+                                t_toks.push_back(tok_id);
                             }
-                            slot = (slot + 1) & VOCAB_MASK;
+                            break;
                         }
+                        slot = (slot + 1) & VOCAB_MASK;
                     }
                 }
-            });
-        }
-        for (auto& w : workers) w.join();
-        workers.clear();
-    };
+                uint32_t tok_count = (uint32_t)t_toks.size() - tok_start;
+                if (tok_count) t_docs.push_back({cur_doc_id, tok_start, tok_count});
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    workers.clear();
 
-    // Pass 1: count term document frequencies
-    run_pass(false);
-
+    std::vector<uint32_t> token_df(num_active_tokens, 0);
     size_t num_bitset_terms = 0;
     for (uint32_t tok_id = 0; tok_id < num_active_tokens; ++tok_id) {
         uint32_t total = 0;
@@ -356,7 +350,8 @@ int main(int argc, char* argv[]) {
         if (total >= BITSET_FREQ_THRESHOLD) num_bitset_terms++;
     }
 
-    bitset_arena.assign(num_bitset_terms * BITSET_WORDS, 0ULL);
+    std::vector<uint64_t> bitset_arena(num_bitset_terms * BITSET_WORDS, 0ULL);
+    std::vector<uint64_t*> term_bitsets(num_active_tokens, nullptr);
     size_t cur_bitset_idx = 0;
     for (uint32_t tok_id = 0; tok_id < num_active_tokens; ++tok_id) {
         if (token_df[tok_id] >= BITSET_FREQ_THRESHOLD) {
@@ -365,8 +360,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    csr_offsets.assign(num_active_tokens + 1, 0);
-    thread_write_ptrs.assign(num_threads * num_active_tokens, 0);
+    std::vector<uint32_t> csr_offsets(num_active_tokens + 1, 0);
+    std::vector<uint32_t> thread_write_ptrs(num_threads * num_active_tokens, 0);
     uint32_t running_total = 0;
     for (uint32_t tok_id = 0; tok_id < num_active_tokens; ++tok_id) {
         csr_offsets[tok_id] = running_total;
@@ -381,10 +376,36 @@ int main(int argc, char* argv[]) {
     }
     csr_offsets[num_active_tokens] = running_total;
     thread_counts.clear(); thread_counts.shrink_to_fit();
-    csr_doc_ids.resize(running_total);
+    std::vector<uint32_t> csr_doc_ids(running_total);
 
-    // Pass 2: direct bitset population + sparse CSR scatter
-    run_pass(true);
+    // Pure in-memory array iteration (NO 2nd pass over 253 MB text!)
+    for (unsigned tid = 0; tid < num_threads; ++tid) {
+        workers.emplace_back([&, tid]() {
+            uint32_t* write_ptrs = &thread_write_ptrs[tid * num_active_tokens];
+            const auto& t_toks = thread_tokens[tid];
+            const auto& t_docs = thread_docs[tid];
+
+            for (const auto& doc : t_docs) {
+                uint32_t cur_doc_id = doc.doc_id;
+                uint32_t start = doc.tok_start;
+                uint32_t count = doc.tok_count;
+                for (uint32_t k = 0; k < count; ++k) {
+                    uint32_t tok_id = t_toks[start + k];
+                    uint64_t* bset = term_bitsets[tok_id];
+                    if (bset) {
+                        reinterpret_cast<std::atomic<uint64_t>*>(bset)[cur_doc_id >> 6].fetch_or(1ULL << (cur_doc_id & 63), std::memory_order_relaxed);
+                    } else {
+                        csr_doc_ids[write_ptrs[tok_id]++] = cur_doc_id;
+                    }
+                }
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    workers.clear();
+
+    thread_tokens.clear(); thread_tokens.shrink_to_fit();
+    thread_docs.clear(); thread_docs.shrink_to_fit();
     thread_write_ptrs.clear(); thread_write_ptrs.shrink_to_fit();
 
     for (size_t i = 0; i < num_bitset_terms; ++i) {
