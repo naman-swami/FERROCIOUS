@@ -88,19 +88,11 @@ inline constexpr auto TOKEN_CHAR = [] {
     return t;
 }();
 
-inline uint64_t tok_hash(const char* p, size_t n) {
+inline uint64_t fnv1a_str(std::string_view s) {
     uint64_t h = 0xcbf29ce484222325ULL;
-    while (n >= 8) {
-        uint64_t v;
-        std::memcpy(&v, p, 8);
-        h = (h ^ (v | 0x2020202020202020ULL)) * 0x100000001b3ULL;
-        p += 8;
-        n -= 8;
-    }
-    if (n) {
-        uint64_t v = 0, m = (1ULL << (8 * n)) - 1;
-        std::memcpy(&v, p, n);
-        h = (h ^ ((v | 0x2020202020202020ULL) & m)) * 0x100000001b3ULL;
+    for (char c : s) {
+        h ^= (uint8_t)c;
+        h *= 0x100000001b3ULL;
     }
     return (h == 0) ? 1 : h;
 }
@@ -189,48 +181,38 @@ inline size_t intersect_small_large(const uint32_t* small, size_t ns,
     return k;
 }
 
-inline bool tok_at(const char* q, const char* s, const char* e, std::string_view t) {
-    if (q < s || q + t.size() > e) return false;
-    if (q > s && TOKEN_CHAR[(uint8_t)q[-1]]) return false; // left boundary
-    if (q + t.size() < e && TOKEN_CHAR[(uint8_t)q[t.size()]]) return false; // right boundary
-    for (size_t i = 0; i < t.size(); ++i)
-        if (TOKEN_CHAR[(uint8_t)q[i]] != (uint8_t)t[i]) return false;
-    return true;
-}
+inline bool match_phrase_kmp_fast(const char* p, const char* end,
+                                  const std::string_view* terms, const size_t* pi, size_t k) {
+    if (k == 0) return true;
+    size_t j = 0;
+    while (p < end) {
+        while (p < end && TOKEN_CHAR[(uint8_t)*p] == 0) ++p;
+        if (p >= end) break;
 
-inline bool phrase_verify(const char* s, const char* e,
-                          const std::string_view* t, size_t k, size_t anc) {
-    const char* q = s;
-    for (;;) {
-        size_t room = (size_t)(e - q);
-        if (room < t[anc].size()) return false;
-        char c0 = t[anc][0];
-        char c1 = ((c0 | 32) >= 'a' && (c0 | 32) <= 'z') ? (char)(c0 ^ 32) : c0;
-        const char* h1 = (const char*)std::memchr(q, c0, room);
-        const char* h2 = (c1 != c0) ? (const char*)std::memchr(q, c1, room) : nullptr;
-        const char* h = h1 && h2 ? (h1 < h2 ? h1 : h2) : (h1 ? h1 : h2);
-        if (!h) return false;
-        if (tok_at(h, s, e, t[anc])) {
-            bool ok = true;
-            const char* r = h + t[anc].size();
-            for (size_t i = anc + 1; i < k && ok; ++i) { // walk right
-                while (r < e && !TOKEN_CHAR[(uint8_t)*r]) ++r;
-                if (!tok_at(r, s, e, t[i])) { ok = false; break; }
-                r += t[i].size();
+        const char* start = p;
+        while (p < end && TOKEN_CHAR[(uint8_t)*p] != 0) ++p;
+        size_t len = p - start;
+
+        auto equals_term = [&](size_t idx) {
+            const auto& expected = terms[idx];
+            if (len != expected.size()) return false;
+            if (len <= 8) {
+                uint64_t w = 0, exp = 0;
+                std::memcpy(&w, start, len);
+                std::memcpy(&exp, expected.data(), len);
+                return (w | 0x2020202020202020ull) == (exp | 0x2020202020202020ull);
             }
-            if (ok) {
-                const char* l = h;
-                for (size_t i = anc; i-- > 0;) { // walk left
-                    while (l > s && !TOKEN_CHAR[(uint8_t)l[-1]]) --l;
-                    if (l - s < (ptrdiff_t)t[i].size() ||
-                        !tok_at(l - t[i].size(), s, e, t[i])) { ok = false; break; }
-                    l -= t[i].size();
-                }
+            for (size_t x = 0; x < len; ++x) {
+                if ((start[x] | 0x20) != (expected[x] | 0x20)) return false;
             }
-            if (ok) return true;
-        }
-        q = h + 1;
+            return true;
+        };
+
+        while (j > 0 && !equals_term(j)) j = pi[j - 1];
+        if (equals_term(j)) ++j;
+        if (j == k) return true;
     }
+    return false;
 }
 
 } // namespace
@@ -264,7 +246,7 @@ int main(int argc, char* argv[]) {
     query_lines.reserve(65536);
 
     auto insert_token = [&](std::string_view sv) -> uint32_t {
-        uint64_t h = tok_hash(sv.data(), sv.size());
+        uint64_t h = fnv1a_str(sv);
         bloom_set(h);
         size_t slot = h & VOCAB_MASK;
         while (vocab_table[slot].hash != 0) {
@@ -278,7 +260,7 @@ int main(int argc, char* argv[]) {
     };
 
     auto find_token = [&](std::string_view sv) -> int64_t {
-        uint64_t h = tok_hash(sv.data(), sv.size());
+        uint64_t h = fnv1a_str(sv);
         if (!bloom_test(h)) return -1;
         size_t slot = h & VOCAB_MASK;
         while (vocab_table[slot].hash != 0) {
@@ -384,11 +366,14 @@ int main(int argc, char* argv[]) {
                 while (p < text_end) {
                     while (p < text_end && TOKEN_CHAR[(uint8_t)*p] == 0) p++;
                     if (p >= text_end) break;
-                    const char* tstart = p;
-                    while (p < text_end && TOKEN_CHAR[(uint8_t)*p] != 0) p++;
-                    size_t tlen = (size_t)(p - tstart);
-
-                    uint64_t h = tok_hash(tstart, tlen);
+                    uint64_t h = 0xcbf29ce484222325ULL;
+                    while (p < text_end) {
+                        uint8_t tc = TOKEN_CHAR[(uint8_t)*p];
+                        if (tc == 0) break;
+                        h = (h ^ tc) * 0x100000001b3ULL;
+                        p++;
+                    }
+                    if (h == 0) h = 1;
                     if (!bloom_test(h)) continue;
 
                     size_t slot = h & VOCAB_MASK;
@@ -460,11 +445,14 @@ int main(int argc, char* argv[]) {
                 while (p < text_end) {
                     while (p < text_end && TOKEN_CHAR[(uint8_t)*p] == 0) p++;
                     if (p >= text_end) break;
-                    const char* tstart = p;
-                    while (p < text_end && TOKEN_CHAR[(uint8_t)*p] != 0) p++;
-                    size_t tlen = (size_t)(p - tstart);
-
-                    uint64_t h = tok_hash(tstart, tlen);
+                    uint64_t h = 0xcbf29ce484222325ULL;
+                    while (p < text_end) {
+                        uint8_t tc = TOKEN_CHAR[(uint8_t)*p];
+                        if (tc == 0) break;
+                        h = (h ^ tc) * 0x100000001b3ULL;
+                        p++;
+                    }
+                    if (h == 0) h = 1;
                     if (!bloom_test(h)) continue;
 
                     size_t slot = h & VOCAB_MASK;
@@ -711,6 +699,14 @@ int main(int argc, char* argv[]) {
                         continue;
                     }
 
+                    size_t k_lim = std::min(num_phrase_terms, (size_t)8);
+                    size_t pi[8] = {};
+                    for (size_t i = 1, j = 0; i < k_lim; ++i) {
+                        while (j > 0 && phrase_terms[i] != phrase_terms[j]) j = pi[j - 1];
+                        if (phrase_terms[i] == phrase_terms[j]) ++j;
+                        pi[i] = j;
+                    }
+
                     std::sort(pinfo, pinfo + num_phrase_terms, [](const auto& a, const auto& b) {
                         return a.len < b.len;
                     });
@@ -752,7 +748,6 @@ int main(int argc, char* argv[]) {
 
                     matches.clear();
                     uint64_t sum_ids = 0;
-                    size_t anc = pinfo[0].term_idx;
 
                     for (size_t k = 0; k < cur_cand_len; ++k) {
                         uint32_t doc_id = cur_cand[k];
@@ -761,7 +756,7 @@ int main(int argc, char* argv[]) {
                             if (span.len >= min_phrase_len) {
                                 const char* s = docs_data + span.off;
                                 const char* e = s + span.len;
-                                if (phrase_verify(s, e, phrase_terms, num_phrase_terms, anc)) {
+                                if (match_phrase_kmp_fast(s, e, phrase_terms, pi, k_lim)) {
                                     matches.push_back(doc_id);
                                     sum_ids += doc_id;
                                 }
