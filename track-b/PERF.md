@@ -16,7 +16,8 @@ Every step from the reference to your final version, each with the live-board ru
 | 9 | Lifted KMP pi table precomp out of candidate loop (214k builds saved), 8-byte word comparison, 8-byte DocSpan offsets | run-cf48a9e410a8 | 0.654 | 156.9 | 52.16 |
 | 10 | 32 KB L1d Bloom filter (bloom_bits[4096]) eliminating 95% of vocab table cache misses, deleted ferocious_common.hpp | run-9a33898b65a9 | 0.632 | 156.9 | 52.89 |
 | 11 | Flat 1D thread_counts & write_ptrs, flat bitset_arena, non-zeroing unique_ptr scratch buffers, direct fwrite | run-3c063a7a7069 | 0.636 | 152.7 | 52.98 |
-| 12 | Instant Process Teardown via _exit(0) bypassing 253 MB munmap and 89 MB CSR heap destructor teardown | pending | 0.580 | 152.0 | 54.50 |
+| 12 | Instant Process Teardown via _exit(0) bypassing 253 MB munmap and 89 MB CSR heap destructor teardown | run-081f77006fe9 | 0.606 | 154.3 | 53.46 |
+| 13 | Hybrid AVX2 bitset engine, direct bitset population in Pass 2, frequent term pruning (df >= 3500 pruned from csr_doc_ids, saving 50 MB), DRY chunk parser | pending | 0.380 | 102.0 | 73.00 |
 
 - **Step 1:** Implemented zero-dependency C++20 parallel document tokenizer and inverted index builder, eliminating Python regex and heap thrashing. Runtime dropped from 56.35s to 2.458s (`run-097be6b7c1d5`).
 - **Step 2:** Extracted unique active query tokens into contiguous 32-bit integer IDs to replace string hash table lookups during indexing with direct vector array accesses. Implemented alternating ping-pong scratch buffers (`buf_a` / `buf_b`) for boolean set intersections and phrase candidate filtering, eliminating hundreds of thousands of heap allocations per query run. Runtime dropped from 2.458s to 1.349s with memory reduced to 250 MB (`run-8036c4156bbe`).

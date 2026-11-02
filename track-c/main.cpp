@@ -267,7 +267,8 @@ int main(int argc, char* argv[]) {
     std::memset(region_to_country, 0xFF, sizeof(region_to_country));
 
     unsigned int num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 4;
+    if (num_threads == 0) num_threads = 6;
+    if (num_threads > 12) num_threads = 12;
 
     {
         MappedFile rmf(regions_path.c_str());

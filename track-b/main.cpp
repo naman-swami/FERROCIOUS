@@ -10,14 +10,13 @@
 #include <chrono>
 #include <array>
 #include <memory>
+#include <atomic>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 
 #ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
-#endif
 #include <windows.h>
 #include <direct.h>
 #else
@@ -30,54 +29,43 @@
 namespace {
 
 struct MappedFile {
-    void*    data = nullptr;
-    size_t   size = 0;
-    bool     ok   = false;
+    void*  data = nullptr;
+    size_t size = 0;
+    bool   ok   = false;
 #ifdef _WIN32
-    HANDLE   hFile = INVALID_HANDLE_VALUE;
-    HANDLE   hMap  = NULL;
-#endif
-
-    explicit MappedFile(const char* path) {
-#ifdef _WIN32
-        hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE hFile = INVALID_HANDLE_VALUE, hMap = NULL;
+    explicit MappedFile(const char* p) {
+        hFile = CreateFileA(p, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
         if (hFile == INVALID_HANDLE_VALUE) return;
         LARGE_INTEGER li;
-        if (!GetFileSizeEx(hFile, &li)) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; return; }
+        if (!GetFileSizeEx(hFile, &li)) { CloseHandle(hFile); return; }
         size = (size_t)li.QuadPart;
-        if (size == 0) { ok = true; return; }
+        if (!size) { ok = true; return; }
         hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-        if (!hMap) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; return; }
         data = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
-        if (!data) { CloseHandle(hMap); hMap = NULL; CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; return; }
-        ok = true;
+        ok = (data != nullptr);
+    }
+    ~MappedFile() {
+        if (data) UnmapViewOfFile(data);
+        if (hMap) CloseHandle(hMap);
+        if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+    }
 #else
-        int fd = ::open(path, O_RDONLY);
+    explicit MappedFile(const char* p) {
+        int fd = ::open(p, O_RDONLY);
         if (fd < 0) return;
         struct stat st;
         if (::fstat(fd, &st) != 0) { ::close(fd); return; }
         size = (size_t)st.st_size;
-        if (size == 0) { ok = true; ::close(fd); return; }
+        if (!size) { ok = true; ::close(fd); return; }
         data = ::mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
         ::close(fd);
         if (data == MAP_FAILED) { data = nullptr; size = 0; return; }
         ok = true;
-        if (size >= (1u << 21))
-            ::madvise(data, size, MADV_SEQUENTIAL | MADV_WILLNEED);
-#endif
+        if (size >= (1u << 21)) ::madvise(data, size, MADV_SEQUENTIAL | MADV_WILLNEED);
     }
-
-    ~MappedFile() {
-#ifdef _WIN32
-        if (data) UnmapViewOfFile(data);
-        if (hMap) CloseHandle(hMap);
-        if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
-#else
-        if (data) ::munmap(data, size);
+    ~MappedFile() { if (data) ::munmap(data, size); }
 #endif
-    }
-    MappedFile(const MappedFile&)            = delete;
-    MappedFile& operator=(const MappedFile&) = delete;
 };
 
 inline constexpr auto TOKEN_CHAR = [] {
@@ -90,50 +78,36 @@ inline constexpr auto TOKEN_CHAR = [] {
 
 inline uint64_t fnv1a_str(std::string_view s) {
     uint64_t h = 0xcbf29ce484222325ULL;
-    for (char c : s) {
-        h ^= (uint8_t)c;
-        h *= 0x100000001b3ULL;
-    }
-    return (h == 0) ? 1 : h;
+    for (char c : s) { h ^= (uint8_t)c; h *= 0x100000001b3ULL; }
+    return h ? h : 1;
 }
 
-static constexpr size_t VOCAB_CAP = 262144;
-static constexpr size_t VOCAB_MASK = VOCAB_CAP - 1;
-
-struct VocabSlot {
-    uint64_t hash = 0;
-    uint32_t token_id = 0;
-};
-
+static constexpr size_t VOCAB_CAP = 262144, VOCAB_MASK = VOCAB_CAP - 1;
+struct VocabSlot { uint64_t hash = 0; uint32_t token_id = 0; };
 static VocabSlot vocab_table[VOCAB_CAP];
 static uint32_t num_active_tokens = 0;
-
 static uint64_t bloom_bits[4096];
 
 inline void bloom_set(uint64_t h) {
     bloom_bits[(h & 0x3FFFF) >> 6] |= (1ULL << (h & 63));
-    uint64_t h2 = h >> 18;
-    bloom_bits[(h2 & 0x3FFFF) >> 6] |= (1ULL << (h2 & 63));
+    bloom_bits[((h >> 18) & 0x3FFFF) >> 6] |= (1ULL << ((h >> 18) & 63));
 }
 
 inline bool bloom_test(uint64_t h) {
-    uint64_t mask1 = 1ULL << (h & 63);
-    if ((bloom_bits[(h & 0x3FFFF) >> 6] & mask1) == 0) return false;
-    uint64_t h2 = h >> 18;
-    uint64_t mask2 = 1ULL << (h2 & 63);
-    return (bloom_bits[(h2 & 0x3FFFF) >> 6] & mask2) != 0;
+    uint64_t m1 = 1ULL << (h & 63);
+    if (!(bloom_bits[(h & 0x3FFFF) >> 6] & m1)) return false;
+    uint64_t m2 = 1ULL << ((h >> 18) & 63);
+    return (bloom_bits[((h >> 18) & 0x3FFFF) >> 6] & m2) != 0;
 }
 
-static constexpr uint32_t BITSET_WORDS = 3908;
+static constexpr uint32_t BITSET_WORDS = 3908, BITSET_FREQ_THRESHOLD = 3500;
 static constexpr uint64_t TAIL_MASK = (1ULL << 16) - 1;
-static constexpr uint32_t BITSET_FREQ_THRESHOLD = 3500;
 
 template <typename T>
 inline void append_uint(std::string& s, T val) {
-    char buf[32];
-    char* p = buf + 32;
-    if (val == 0) { s.push_back('0'); return; }
-    while (val > 0) { *--p = '0' + (val % 10); val /= 10; }
+    char buf[32]; char* p = buf + 32;
+    if (!val) { s.push_back('0'); return; }
+    while (val) { *--p = '0' + (val % 10); val /= 10; }
     s.append(p, (buf + 32) - p);
 }
 
@@ -142,74 +116,50 @@ inline size_t setop(const uint32_t* a, size_t na, const uint32_t* b, size_t nb, 
     size_t ia = 0, ib = 0, k = 0;
     while (ia < na && ib < nb) {
         uint32_t va = a[ia], vb = b[ib];
-        if (va == vb) {
-            if constexpr (EQ) out[k++] = va;
-            ia++; ib++;
-        } else if (va < vb) {
-            if constexpr (AO) out[k++] = va;
-            ia++;
-        } else {
-            if constexpr (BO) out[k++] = vb;
-            ib++;
-        }
+        if (va == vb) { if constexpr (EQ) out[k++] = va; ia++; ib++; }
+        else if (va < vb) { if constexpr (AO) out[k++] = va; ia++; }
+        else { if constexpr (BO) out[k++] = vb; ib++; }
     }
     if constexpr (AO) while (ia < na) out[k++] = a[ia++];
     if constexpr (BO) while (ib < nb) out[k++] = b[ib++];
     return k;
 }
 
-inline size_t intersect_small_large(const uint32_t* small, size_t ns,
-                                    const uint32_t* large, size_t nl,
-                                    uint32_t* out) {
+inline size_t intersect_small_large(const uint32_t* sm, size_t ns, const uint32_t* lg, size_t nl, uint32_t* out) {
     size_t j = 0, k = 0;
     for (size_t i = 0; i < ns && j < nl; ++i) {
-        uint32_t target = small[i];
-        size_t step = 1, right = j;
-        while (right < nl && large[right] < target) {
-            j = right;
-            right += step;
-            step <<= 1;
-        }
-        if (right > nl) right = nl;
-        const uint32_t* it = std::lower_bound(large + j, large + right, target);
-        j = static_cast<size_t>(it - large);
-        if (j < nl && large[j] == target) {
-            out[k++] = target;
-            ++j;
-        }
+        uint32_t tgt = sm[i], st = 1, r = j;
+        while (r < nl && lg[r] < tgt) { j = r; r += st; st <<= 1; }
+        if (r > nl) r = nl;
+        const uint32_t* it = std::lower_bound(lg + j, lg + r, tgt);
+        j = (size_t)(it - lg);
+        if (j < nl && lg[j] == tgt) { out[k++] = tgt; ++j; }
     }
     return k;
 }
 
-inline bool match_phrase_kmp_fast(const char* p, const char* end,
-                                  const std::string_view* terms, const size_t* pi, size_t k) {
-    if (k == 0) return true;
+inline bool match_phrase_kmp_fast(const char* p, const char* end, const std::string_view* terms, const size_t* pi, size_t k) {
+    if (!k) return true;
     size_t j = 0;
     while (p < end) {
-        while (p < end && TOKEN_CHAR[(uint8_t)*p] == 0) ++p;
+        while (p < end && !TOKEN_CHAR[(uint8_t)*p]) ++p;
         if (p >= end) break;
-
         const char* start = p;
-        while (p < end && TOKEN_CHAR[(uint8_t)*p] != 0) ++p;
+        while (p < end && TOKEN_CHAR[(uint8_t)*p]) ++p;
         size_t len = p - start;
-
-        auto equals_term = [&](size_t idx) {
-            const auto& expected = terms[idx];
-            if (len != expected.size()) return false;
+        auto eq = [&](size_t idx) {
+            const auto& exp = terms[idx];
+            if (len != exp.size()) return false;
             if (len <= 8) {
-                uint64_t w = 0, exp = 0;
-                std::memcpy(&w, start, len);
-                std::memcpy(&exp, expected.data(), len);
-                return (w | 0x2020202020202020ull) == (exp | 0x2020202020202020ull);
+                uint64_t w = 0, e = 0;
+                std::memcpy(&w, start, len); std::memcpy(&e, exp.data(), len);
+                return (w | 0x2020202020202020ull) == (e | 0x2020202020202020ull);
             }
-            for (size_t x = 0; x < len; ++x) {
-                if ((start[x] | 0x20) != (expected[x] | 0x20)) return false;
-            }
+            for (size_t x = 0; x < len; ++x) if ((start[x] | 0x20) != (exp[x] | 0x20)) return false;
             return true;
         };
-
-        while (j > 0 && !equals_term(j)) j = pi[j - 1];
-        if (equals_term(j)) ++j;
+        while (j > 0 && !eq(j)) j = pi[j - 1];
+        if (eq(j)) ++j;
         if (j == k) return true;
     }
     return false;
@@ -224,22 +174,18 @@ int main(int argc, char* argv[]) {
     std::string data_dir = (argc > 1) ? argv[1] : "/data";
     std::string out_dir  = (argc > 2) ? argv[2] : "/out";
 
-    std::string docs_path = data_dir + "/docs.txt";
-    std::string queries_path = data_dir + "/queries.txt";
-    std::string results_path = out_dir + "/results.txt";
-
-    MappedFile dmf(docs_path.c_str());
+    MappedFile dmf((data_dir + "/docs.txt").c_str());
     if (!dmf.ok) return 1;
-    const char* docs_data = static_cast<const char*>(dmf.data);
+    const char* docs_data = (const char*)dmf.data;
     size_t docs_size = dmf.size;
 
-    MappedFile qmf(queries_path.c_str());
+    MappedFile qmf((data_dir + "/queries.txt").c_str());
     if (!qmf.ok) return 1;
-    const char* queries_data = static_cast<const char*>(qmf.data);
-    size_t queries_size = qmf.size;
+    const char* qp = (const char*)qmf.data;
+    const char* qend = qp + qmf.size;
 
     unsigned num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 6;
+    if (!num_threads) num_threads = 6;
     if (num_threads > 12) num_threads = 12;
 
     std::vector<std::string_view> query_lines;
@@ -248,36 +194,34 @@ int main(int argc, char* argv[]) {
     auto insert_token = [&](std::string_view sv) -> uint32_t {
         uint64_t h = fnv1a_str(sv);
         bloom_set(h);
-        size_t slot = h & VOCAB_MASK;
-        while (vocab_table[slot].hash != 0) {
-            if (vocab_table[slot].hash == h) return vocab_table[slot].token_id;
-            slot = (slot + 1) & VOCAB_MASK;
+        size_t s = h & VOCAB_MASK;
+        while (vocab_table[s].hash) {
+            if (vocab_table[s].hash == h) return vocab_table[s].token_id;
+            s = (s + 1) & VOCAB_MASK;
         }
-        uint32_t new_id = num_active_tokens++;
-        vocab_table[slot].hash = h;
-        vocab_table[slot].token_id = new_id;
-        return new_id;
+        uint32_t nid = num_active_tokens++;
+        vocab_table[s].hash = h;
+        vocab_table[s].token_id = nid;
+        return nid;
     };
 
     auto find_token = [&](std::string_view sv) -> int64_t {
         uint64_t h = fnv1a_str(sv);
         if (!bloom_test(h)) return -1;
-        size_t slot = h & VOCAB_MASK;
-        while (vocab_table[slot].hash != 0) {
-            if (vocab_table[slot].hash == h) return vocab_table[slot].token_id;
-            slot = (slot + 1) & VOCAB_MASK;
+        size_t s = h & VOCAB_MASK;
+        while (vocab_table[s].hash) {
+            if (vocab_table[s].hash == h) return vocab_table[s].token_id;
+            s = (s + 1) & VOCAB_MASK;
         }
         return -1;
     };
 
-    const char* qp = queries_data;
-    const char* qend = queries_data + queries_size;
     while (qp < qend) {
-        const char* nl = static_cast<const char*>(std::memchr(qp, '\n', qend - qp));
-        const char* line_end = nl ? nl : qend;
-        size_t line_len = line_end - qp;
-        while (line_len > 0 && (qp[line_len - 1] == '\r' || qp[line_len - 1] == ' ' || qp[line_len - 1] == '\t')) line_len--;
-        std::string_view qline(qp, line_len);
+        const char* nl = (const char*)std::memchr(qp, '\n', qend - qp);
+        const char* le = nl ? nl : qend;
+        size_t len = le - qp;
+        while (len > 0 && (qp[len - 1] == '\r' || qp[len - 1] == ' ' || qp[len - 1] == '\t')) len--;
+        std::string_view qline(qp, len);
         query_lines.push_back(qline);
 
         if (qline.starts_with("BOOL ")) {
@@ -285,226 +229,167 @@ int main(int argc, char* argv[]) {
             while (p < qline.size()) {
                 while (p < qline.size() && qline[p] == ' ') p++;
                 if (p >= qline.size()) break;
-                size_t next_sp = qline.find(' ', p);
-                if (next_sp == std::string_view::npos) next_sp = qline.size();
-                std::string_view word = qline.substr(p, next_sp - p);
-                p = next_sp;
-                if (word != "AND" && word != "OR" && word != "NOT") {
-                    insert_token(word);
-                }
+                size_t sp = qline.find(' ', p);
+                if (sp == std::string_view::npos) sp = qline.size();
+                std::string_view w = qline.substr(p, sp - p);
+                p = sp;
+                if (w != "AND" && w != "OR" && w != "NOT") insert_token(w);
             }
         } else if (qline.starts_with("PHRASE \"")) {
-            std::string_view inner = qline.substr(8);
-            if (!inner.empty() && inner.back() == '"') inner.remove_suffix(1);
+            std::string_view in = qline.substr(8);
+            if (!in.empty() && in.back() == '"') in.remove_suffix(1);
             size_t p = 0;
-            while (p < inner.size()) {
-                while (p < inner.size() && inner[p] == ' ') p++;
-                if (p >= inner.size()) break;
-                size_t next_sp = inner.find(' ', p);
-                if (next_sp == std::string_view::npos) next_sp = inner.size();
-                std::string_view word = inner.substr(p, next_sp - p);
-                p = next_sp;
-                insert_token(word);
+            while (p < in.size()) {
+                while (p < in.size() && in[p] == ' ') p++;
+                if (p >= in.size()) break;
+                size_t sp = in.find(' ', p);
+                if (sp == std::string_view::npos) sp = in.size();
+                insert_token(in.substr(p, sp - p));
+                p = sp;
             }
         }
         qp = nl ? nl + 1 : qend;
     }
 
     size_t chunk_bytes = docs_size / num_threads;
-    std::vector<const char*> chunk_starts(num_threads);
-    std::vector<const char*> chunk_ends(num_threads);
-
+    std::vector<const char*> chunk_starts(num_threads), chunk_ends(num_threads);
     for (unsigned tid = 0; tid < num_threads; ++tid) {
         const char* s = docs_data + tid * chunk_bytes;
         const char* e = (tid == num_threads - 1) ? (docs_data + docs_size) : (docs_data + (tid + 1) * chunk_bytes);
         if (tid > 0) { while (s < docs_data + docs_size && *s != '\n') s++; if (s < docs_data + docs_size) s++; }
         if (tid < num_threads - 1) { while (e < docs_data + docs_size && *e != '\n') e++; if (e < docs_data + docs_size) e++; }
-        chunk_starts[tid] = s;
-        chunk_ends[tid] = e;
+        chunk_starts[tid] = s; chunk_ends[tid] = e;
     }
 
-    struct DocSpan {
-        uint32_t off = 0;
-        uint32_t len = 0;
-    };
+    struct DocSpan { uint32_t off = 0, len = 0; };
     constexpr size_t MAX_DOCS = 262144;
     std::vector<DocSpan> doc_spans(MAX_DOCS);
-
-    // Flattened 1D thread_counts: num_threads * num_active_tokens
     std::vector<uint32_t> thread_counts(num_threads * num_active_tokens, 0);
     std::vector<std::thread> workers;
 
-    for (unsigned tid = 0; tid < num_threads; ++tid) {
-        workers.emplace_back([&, tid]() {
-            const char* cur = chunk_starts[tid];
-            const char* limit = chunk_ends[tid];
-            uint32_t* counts = &thread_counts[tid * num_active_tokens];
-            std::vector<uint32_t> last_doc_seen(num_active_tokens, 0xFFFFFFFFu);
+    // DRY Unified chunk parser lambda
+    std::vector<uint32_t> csr_offsets, thread_write_ptrs, csr_doc_ids, token_df(num_active_tokens, 0);
+    std::vector<uint64_t> bitset_arena;
+    std::vector<uint64_t*> term_bitsets(num_active_tokens, nullptr);
 
-            while (cur < limit) {
-                uint32_t cur_doc_id = 0;
-                while (cur < limit && static_cast<unsigned char>(*cur - '0') <= 9) {
-                    cur_doc_id = cur_doc_id * 10 + (*cur - '0');
-                    cur++;
-                }
-                if (cur < limit && *cur == '\t') cur++;
-                if (cur >= limit) break;
+    auto run_pass = [&](bool is_pass_2) {
+        for (unsigned tid = 0; tid < num_threads; ++tid) {
+            workers.emplace_back([&, tid]() {
+                const char* cur = chunk_starts[tid];
+                const char* limit = chunk_ends[tid];
+                uint32_t* counts = is_pass_2 ? nullptr : &thread_counts[tid * num_active_tokens];
+                uint32_t* write_ptrs = is_pass_2 ? &thread_write_ptrs[tid * num_active_tokens] : nullptr;
+                std::vector<uint32_t> last_doc(num_active_tokens, 0xFFFFFFFFu);
 
-                const char* text_start = cur;
-                const char* nl = static_cast<const char*>(std::memchr(cur, '\n', limit - cur));
-                const char* line_end = nl ? nl : limit;
-                cur = nl ? nl + 1 : limit;
+                while (cur < limit) {
+                    uint32_t cur_doc_id = 0;
+                    while (cur < limit && static_cast<unsigned char>(*cur - '0') <= 9) {
+                        cur_doc_id = cur_doc_id * 10 + (*cur - '0');
+                        cur++;
+                    }
+                    if (cur < limit && *cur == '\t') cur++;
+                    if (cur >= limit) break;
 
-                const char* text_end = line_end;
-                while (text_end > text_start && (text_end[-1] == '\r' || text_end[-1] == ' ' || text_end[-1] == '\t')) text_end--;
+                    const char* text_start = cur;
+                    const char* nl = (const char*)std::memchr(cur, '\n', limit - cur);
+                    const char* line_end = nl ? nl : limit;
+                    cur = nl ? nl + 1 : limit;
 
-                if (cur_doc_id < MAX_DOCS) {
-                    doc_spans[cur_doc_id] = {(uint32_t)(text_start - docs_data), (uint32_t)(text_end - text_start)};
-                }
+                    const char* text_end = line_end;
+                    while (text_end > text_start && (text_end[-1] == '\r' || text_end[-1] == ' ' || text_end[-1] == '\t')) text_end--;
 
-                const char* p = text_start;
-                while (p < text_end) {
-                    while (p < text_end && TOKEN_CHAR[(uint8_t)*p] == 0) p++;
-                    if (p >= text_end) break;
-                    uint64_t h = 0xcbf29ce484222325ULL;
+                    if (!is_pass_2 && cur_doc_id < MAX_DOCS) {
+                        doc_spans[cur_doc_id] = {(uint32_t)(text_start - docs_data), (uint32_t)(text_end - text_start)};
+                    }
+
+                    const char* p = text_start;
                     while (p < text_end) {
-                        uint8_t tc = TOKEN_CHAR[(uint8_t)*p];
-                        if (tc == 0) break;
-                        h = (h ^ tc) * 0x100000001b3ULL;
-                        p++;
-                    }
-                    if (h == 0) h = 1;
-                    if (!bloom_test(h)) continue;
-
-                    size_t slot = h & VOCAB_MASK;
-                    while (vocab_table[slot].hash != 0) {
-                        if (vocab_table[slot].hash == h) {
-                            uint32_t tok_id = vocab_table[slot].token_id;
-                            if (last_doc_seen[tok_id] != cur_doc_id) {
-                                counts[tok_id]++;
-                                last_doc_seen[tok_id] = cur_doc_id;
-                            }
-                            break;
+                        while (p < text_end && !TOKEN_CHAR[(uint8_t)*p]) p++;
+                        if (p >= text_end) break;
+                        uint64_t h = 0xcbf29ce484222325ULL;
+                        while (p < text_end) {
+                            uint8_t tc = TOKEN_CHAR[(uint8_t)*p];
+                            if (!tc) break;
+                            h = (h ^ tc) * 0x100000001b3ULL;
+                            p++;
                         }
-                        slot = (slot + 1) & VOCAB_MASK;
+                        if (!h) h = 1;
+                        if (!bloom_test(h)) continue;
+
+                        size_t slot = h & VOCAB_MASK;
+                        while (vocab_table[slot].hash) {
+                            if (vocab_table[slot].hash == h) {
+                                uint32_t tok_id = vocab_table[slot].token_id;
+                                if (last_doc[tok_id] != cur_doc_id) {
+                                    last_doc[tok_id] = cur_doc_id;
+                                    if (!is_pass_2) {
+                                        counts[tok_id]++;
+                                    } else {
+                                        uint64_t* bset = term_bitsets[tok_id];
+                                        if (bset) {
+                                            reinterpret_cast<std::atomic<uint64_t>*>(bset)[cur_doc_id >> 6].fetch_or(1ULL << (cur_doc_id & 63), std::memory_order_relaxed);
+                                        } else {
+                                            csr_doc_ids[write_ptrs[tok_id]++] = cur_doc_id;
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                            slot = (slot + 1) & VOCAB_MASK;
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
+        for (auto& w : workers) w.join();
+        workers.clear();
+    };
+
+    // Pass 1: count term document frequencies
+    run_pass(false);
+
+    size_t num_bitset_terms = 0;
+    for (uint32_t tok_id = 0; tok_id < num_active_tokens; ++tok_id) {
+        uint32_t total = 0;
+        for (unsigned tid = 0; tid < num_threads; ++tid) total += thread_counts[tid * num_active_tokens + tok_id];
+        token_df[tok_id] = total;
+        if (total >= BITSET_FREQ_THRESHOLD) num_bitset_terms++;
     }
-    for (auto& w : workers) w.join();
-    workers.clear();
 
-    std::vector<uint32_t> csr_offsets(num_active_tokens + 1, 0);
-    // Flattened 1D thread_write_ptrs: num_threads * num_active_tokens
-    std::vector<uint32_t> thread_write_ptrs(num_threads * num_active_tokens, 0);
+    bitset_arena.assign(num_bitset_terms * BITSET_WORDS, 0ULL);
+    size_t cur_bitset_idx = 0;
+    for (uint32_t tok_id = 0; tok_id < num_active_tokens; ++tok_id) {
+        if (token_df[tok_id] >= BITSET_FREQ_THRESHOLD) {
+            term_bitsets[tok_id] = bitset_arena.data() + cur_bitset_idx * BITSET_WORDS;
+            cur_bitset_idx++;
+        }
+    }
 
+    csr_offsets.assign(num_active_tokens + 1, 0);
+    thread_write_ptrs.assign(num_threads * num_active_tokens, 0);
     uint32_t running_total = 0;
     for (uint32_t tok_id = 0; tok_id < num_active_tokens; ++tok_id) {
         csr_offsets[tok_id] = running_total;
-        uint32_t t_base = running_total;
-        for (unsigned tid = 0; tid < num_threads; ++tid) {
-            thread_write_ptrs[tid * num_active_tokens + tok_id] = t_base;
-            t_base += thread_counts[tid * num_active_tokens + tok_id];
+        if (token_df[tok_id] < BITSET_FREQ_THRESHOLD) {
+            uint32_t t_base = running_total;
+            for (unsigned tid = 0; tid < num_threads; ++tid) {
+                thread_write_ptrs[tid * num_active_tokens + tok_id] = t_base;
+                t_base += thread_counts[tid * num_active_tokens + tok_id];
+            }
+            running_total = t_base;
         }
-        running_total = t_base;
     }
     csr_offsets[num_active_tokens] = running_total;
-    uint32_t total_postings = running_total;
+    thread_counts.clear(); thread_counts.shrink_to_fit();
+    csr_doc_ids.resize(running_total);
 
-    thread_counts.clear();
-    thread_counts.shrink_to_fit();
+    // Pass 2: direct bitset population + sparse CSR scatter
+    run_pass(true);
+    thread_write_ptrs.clear(); thread_write_ptrs.shrink_to_fit();
 
-    std::vector<uint32_t> csr_doc_ids(total_postings);
-
-    for (unsigned tid = 0; tid < num_threads; ++tid) {
-        workers.emplace_back([&, tid]() {
-            uint32_t* write_ptrs = &thread_write_ptrs[tid * num_active_tokens];
-            const char* cur = chunk_starts[tid];
-            const char* limit = chunk_ends[tid];
-            std::vector<uint32_t> last_doc_seen(num_active_tokens, 0xFFFFFFFFu);
-
-            while (cur < limit) {
-                uint32_t cur_doc_id = 0;
-                while (cur < limit && static_cast<unsigned char>(*cur - '0') <= 9) {
-                    cur_doc_id = cur_doc_id * 10 + (*cur - '0');
-                    cur++;
-                }
-                if (cur < limit && *cur == '\t') cur++;
-                if (cur >= limit) break;
-
-                const char* text_start = cur;
-                const char* nl = static_cast<const char*>(std::memchr(cur, '\n', limit - cur));
-                const char* line_end = nl ? nl : limit;
-                cur = nl ? nl + 1 : limit;
-
-                const char* text_end = line_end;
-                while (text_end > text_start && (text_end[-1] == '\r' || text_end[-1] == ' ' || text_end[-1] == '\t')) text_end--;
-
-                const char* p = text_start;
-                while (p < text_end) {
-                    while (p < text_end && TOKEN_CHAR[(uint8_t)*p] == 0) p++;
-                    if (p >= text_end) break;
-                    uint64_t h = 0xcbf29ce484222325ULL;
-                    while (p < text_end) {
-                        uint8_t tc = TOKEN_CHAR[(uint8_t)*p];
-                        if (tc == 0) break;
-                        h = (h ^ tc) * 0x100000001b3ULL;
-                        p++;
-                    }
-                    if (h == 0) h = 1;
-                    if (!bloom_test(h)) continue;
-
-                    size_t slot = h & VOCAB_MASK;
-                    while (vocab_table[slot].hash != 0) {
-                        if (vocab_table[slot].hash == h) {
-                            uint32_t tok_id = vocab_table[slot].token_id;
-                            if (last_doc_seen[tok_id] != cur_doc_id) {
-                                last_doc_seen[tok_id] = cur_doc_id;
-                                uint32_t pos = write_ptrs[tok_id]++;
-                                csr_doc_ids[pos] = cur_doc_id;
-                            }
-                            break;
-                        }
-                        slot = (slot + 1) & VOCAB_MASK;
-                    }
-                }
-            }
-        });
-    }
-    for (auto& w : workers) w.join();
-    workers.clear();
-
-    thread_write_ptrs.clear();
-    thread_write_ptrs.shrink_to_fit();
-
-    std::vector<const uint64_t*> term_bitsets(num_active_tokens, nullptr);
-    size_t num_bitset_terms = 0;
-    for (uint32_t tok_id = 0; tok_id < num_active_tokens; ++tok_id) {
-        if (csr_offsets[tok_id + 1] - csr_offsets[tok_id] >= BITSET_FREQ_THRESHOLD) {
-            num_bitset_terms++;
-        }
-    }
-    // Flattened 1D bitset_arena
-    std::vector<uint64_t> bitset_arena(num_bitset_terms * BITSET_WORDS, 0ULL);
-    size_t cur_bitset_idx = 0;
-
-    for (uint32_t tok_id = 0; tok_id < num_active_tokens; ++tok_id) {
-        uint32_t start = csr_offsets[tok_id];
-        uint32_t end = csr_offsets[tok_id + 1];
-        uint32_t df = end - start;
-        if (df >= BITSET_FREQ_THRESHOLD) {
-            uint64_t* bits = bitset_arena.data() + cur_bitset_idx * BITSET_WORDS;
-            const uint32_t* docs = csr_doc_ids.data() + start;
-            for (uint32_t i = 0; i < df; ++i) {
-                uint32_t doc = docs[i];
-                bits[doc >> 6] |= (1ULL << (doc & 63));
-            }
-            bits[3906] &= TAIL_MASK;
-            bits[3907] = 0ULL;
-            term_bitsets[tok_id] = bits;
-            cur_bitset_idx++;
-        }
+    for (size_t i = 0; i < num_bitset_terms; ++i) {
+        uint64_t* bits = bitset_arena.data() + i * BITSET_WORDS;
+        bits[3906] &= TAIL_MASK; bits[3907] = 0ULL;
     }
 
     std::vector<std::string> thread_outputs(num_threads);
@@ -520,14 +405,10 @@ int main(int argc, char* argv[]) {
             std::string& out_str = thread_outputs[tid];
             out_str.reserve(1024 * 1024);
 
-            // Raw unique_ptr buffers: bypass 24 MB of zero-fill memset
-            std::unique_ptr<uint32_t[]> buf_a(new uint32_t[262144]);
-            std::unique_ptr<uint32_t[]> buf_b(new uint32_t[262144]);
-            std::vector<uint32_t> matches;
-            matches.reserve(65536);
-
-            std::string_view parts[32];
-            std::string_view phrase_terms[32];
+            std::unique_ptr<uint32_t[]> buf_a(new uint32_t[262144]), buf_b(new uint32_t[262144]);
+            std::unique_ptr<uint64_t[]> dense_scratch(new uint64_t[BITSET_WORDS]);
+            std::vector<uint32_t> matches; matches.reserve(65536);
+            std::string_view parts[32], phrase_terms[32];
 
             for (size_t qidx = q_start; qidx < q_end; ++qidx) {
                 std::string_view qline = query_lines[qidx];
@@ -537,270 +418,277 @@ int main(int argc, char* argv[]) {
                     size_t num_parts = 0, pos = 0;
                     while (pos < rest.size() && num_parts < 32) {
                         size_t next_sp = rest.find(' ', pos);
-                        if (next_sp == std::string_view::npos) {
-                            parts[num_parts++] = rest.substr(pos);
-                            break;
-                        }
+                        if (next_sp == std::string_view::npos) { parts[num_parts++] = rest.substr(pos); break; }
                         parts[num_parts++] = rest.substr(pos, next_sp - pos);
                         pos = next_sp + 1;
                     }
-
-                    if (num_parts == 0) {
-                        out_str.append("0 0\n");
-                        continue;
-                    }
+                    if (!num_parts) { out_str.append("0 0\n"); continue; }
 
                     int64_t id0 = find_token(parts[0]);
-                    uint32_t* cur_buf = buf_a.get();
-                    uint32_t* next_buf = buf_b.get();
+                    bool is_dense = false;
+                    uint32_t* cur_buf = buf_a.get(), *next_buf = buf_b.get();
+                    uint64_t* dense_buf = dense_scratch.get();
                     size_t cur_len = 0;
 
                     if (id0 >= 0 && (size_t)id0 < num_active_tokens) {
-                        uint32_t start = csr_offsets[id0];
-                        uint32_t end = csr_offsets[id0 + 1];
-                        cur_len = end - start;
-                        if (cur_len > 0) {
-                            std::memcpy(cur_buf, csr_doc_ids.data() + start, cur_len * sizeof(uint32_t));
+                        const uint64_t* bset0 = term_bitsets[id0];
+                        if (bset0) {
+                            std::memcpy(dense_buf, bset0, BITSET_WORDS * sizeof(uint64_t));
+                            is_dense = true;
+                        } else {
+                            uint32_t start = csr_offsets[id0];
+                            cur_len = csr_offsets[id0 + 1] - start;
+                            if (cur_len) std::memcpy(cur_buf, csr_doc_ids.data() + start, cur_len * sizeof(uint32_t));
                         }
                     }
 
                     for (size_t i = 1; i + 1 < num_parts; i += 2) {
-                        std::string_view op = parts[i];
-                        std::string_view term = parts[i + 1];
-
+                        std::string_view op = parts[i], term = parts[i + 1];
                         int64_t post_id = find_token(term);
                         const uint32_t* post_data = nullptr;
                         size_t post_len = 0;
                         const uint64_t* post_bitset = nullptr;
 
                         if (post_id >= 0 && (size_t)post_id < num_active_tokens) {
-                            uint32_t start = csr_offsets[post_id];
-                            uint32_t end = csr_offsets[post_id + 1];
-                            post_len = end - start;
-                            post_data = csr_doc_ids.data() + start;
                             post_bitset = term_bitsets[post_id];
+                            if (!post_bitset) {
+                                uint32_t start = csr_offsets[post_id];
+                                post_len = csr_offsets[post_id + 1] - start;
+                                post_data = csr_doc_ids.data() + start;
+                            }
                         }
-
-                        size_t next_len = 0;
 
                         if (op == "AND") {
-                            if (cur_len > 0 && post_len > 0) {
+                            if (is_dense) {
+                                if (post_bitset) {
+                                    for (size_t w = 0; w < BITSET_WORDS; w += 4) {
+                                        __m256i a = _mm256_loadu_si256((const __m256i*)(dense_buf + w));
+                                        __m256i b = _mm256_loadu_si256((const __m256i*)(post_bitset + w));
+                                        _mm256_storeu_si256((__m256i*)(dense_buf + w), _mm256_and_si256(a, b));
+                                    }
+                                } else {
+                                    size_t next_len = 0;
+                                    for (size_t k = 0; k < post_len; ++k) {
+                                        uint32_t doc = post_data[k];
+                                        if (dense_buf[doc >> 6] & (1ULL << (doc & 63))) cur_buf[next_len++] = doc;
+                                    }
+                                    cur_len = next_len; is_dense = false;
+                                }
+                            } else if (cur_len > 0) {
+                                size_t next_len = 0;
                                 if (post_bitset) {
                                     for (size_t k = 0; k < cur_len; ++k) {
                                         uint32_t doc = cur_buf[k];
-                                        if ((post_bitset[doc >> 6] & (1ULL << (doc & 63))) != 0) {
-                                            next_buf[next_len++] = doc;
-                                        }
+                                        if (post_bitset[doc >> 6] & (1ULL << (doc & 63))) next_buf[next_len++] = doc;
+                                    }
+                                } else if (post_len > 0) {
+                                    if (post_len * 8 < cur_len) next_len = intersect_small_large(post_data, post_len, cur_buf, cur_len, next_buf);
+                                    else if (cur_len * 8 < post_len) next_len = intersect_small_large(cur_buf, cur_len, post_data, post_len, next_buf);
+                                    else next_len = setop<true, false, false>(cur_buf, cur_len, post_data, post_len, next_buf);
+                                }
+                                cur_len = next_len; std::swap(cur_buf, next_buf);
+                            }
+                        } else if (op == "OR") {
+                            if (is_dense) {
+                                if (post_bitset) {
+                                    for (size_t w = 0; w < BITSET_WORDS; w += 4) {
+                                        __m256i a = _mm256_loadu_si256((const __m256i*)(dense_buf + w));
+                                        __m256i b = _mm256_loadu_si256((const __m256i*)(post_bitset + w));
+                                        _mm256_storeu_si256((__m256i*)(dense_buf + w), _mm256_or_si256(a, b));
                                     }
                                 } else {
-                                    if (post_len * 8 < cur_len) {
-                                        next_len = intersect_small_large(post_data, post_len, cur_buf, cur_len, next_buf);
-                                    } else if (cur_len * 8 < post_len) {
-                                        next_len = intersect_small_large(cur_buf, cur_len, post_data, post_len, next_buf);
-                                    } else {
-                                        next_len = setop<true, false, false>(cur_buf, cur_len, post_data, post_len, next_buf);
+                                    for (size_t k = 0; k < post_len; ++k) {
+                                        uint32_t doc = post_data[k]; dense_buf[doc >> 6] |= (1ULL << (doc & 63));
                                     }
                                 }
-                            }
-                            cur_len = next_len;
-                            std::swap(cur_buf, next_buf);
-                        } else if (op == "OR") {
-                            if (post_len > 0) {
-                                next_len = setop<true, true, true>(cur_buf, cur_len, post_data, post_len, next_buf);
-                                cur_len = next_len;
-                                std::swap(cur_buf, next_buf);
+                            } else {
+                                if (post_bitset) {
+                                    std::memcpy(dense_buf, post_bitset, BITSET_WORDS * sizeof(uint64_t));
+                                    for (size_t k = 0; k < cur_len; ++k) {
+                                        uint32_t doc = cur_buf[k]; dense_buf[doc >> 6] |= (1ULL << (doc & 63));
+                                    }
+                                    is_dense = true;
+                                } else if (post_len > 0) {
+                                    size_t next_len = setop<true, true, true>(cur_buf, cur_len, post_data, post_len, next_buf);
+                                    cur_len = next_len; std::swap(cur_buf, next_buf);
+                                }
                             }
                         } else if (op == "NOT") {
-                            if (cur_len > 0 && post_len > 0) {
+                            if (is_dense) {
+                                if (post_bitset) {
+                                    for (size_t w = 0; w < BITSET_WORDS; w += 4) {
+                                        __m256i a = _mm256_loadu_si256((const __m256i*)(dense_buf + w));
+                                        __m256i b = _mm256_loadu_si256((const __m256i*)(post_bitset + w));
+                                        _mm256_storeu_si256((__m256i*)(dense_buf + w), _mm256_andnot_si256(b, a));
+                                    }
+                                } else {
+                                    for (size_t k = 0; k < post_len; ++k) {
+                                        uint32_t doc = post_data[k]; dense_buf[doc >> 6] &= ~(1ULL << (doc & 63));
+                                    }
+                                }
+                            } else if (cur_len > 0) {
+                                size_t next_len = 0;
                                 if (post_bitset) {
                                     for (size_t k = 0; k < cur_len; ++k) {
                                         uint32_t doc = cur_buf[k];
-                                        if ((post_bitset[doc >> 6] & (1ULL << (doc & 63))) == 0) {
-                                            next_buf[next_len++] = doc;
-                                        }
+                                        if (!(post_bitset[doc >> 6] & (1ULL << (doc & 63)))) next_buf[next_len++] = doc;
                                     }
-                                    cur_len = next_len;
-                                    std::swap(cur_buf, next_buf);
-                                } else {
+                                    cur_len = next_len; std::swap(cur_buf, next_buf);
+                                } else if (post_len > 0) {
                                     next_len = setop<false, true, false>(cur_buf, cur_len, post_data, post_len, next_buf);
-                                    cur_len = next_len;
-                                    std::swap(cur_buf, next_buf);
+                                    cur_len = next_len; std::swap(cur_buf, next_buf);
                                 }
                             }
                         }
                     }
 
-                    if (cur_len == 0) {
-                        out_str.append("0 0\n");
+                    if (is_dense) {
+                        dense_buf[3906] &= TAIL_MASK; dense_buf[3907] = 0ULL;
+                        uint32_t total_matches = 0; uint64_t sum_ids = 0;
+                        uint32_t first10[10]; size_t first10_count = 0;
+                        for (size_t w = 0; w < BITSET_WORDS; ++w) {
+                            uint64_t word = dense_buf[w];
+                            if (!word) continue;
+                            total_matches += (uint32_t)std::popcount(word);
+                            uint32_t base_id = (uint32_t)w << 6;
+                            while (word) {
+                                uint32_t b = (uint32_t)__builtin_ctzll(word);
+                                uint32_t doc_id = base_id + b;
+                                sum_ids += doc_id;
+                                if (first10_count < 10) first10[first10_count++] = doc_id;
+                                word &= word - 1;
+                            }
+                        }
+                        if (!total_matches) { out_str.append("0 0\n"); }
+                        else {
+                            append_uint(out_str, total_matches); out_str.push_back(' ');
+                            append_uint(out_str, sum_ids);
+                            for (size_t k = 0; k < first10_count; ++k) { out_str.push_back(' '); append_uint(out_str, first10[k]); }
+                            out_str.push_back('\n');
+                        }
                     } else {
-                        uint64_t sum_ids = 0;
-                        for (size_t k = 0; k < cur_len; ++k) {
-                            sum_ids += cur_buf[k];
+                        if (!cur_len) { out_str.append("0 0\n"); }
+                        else {
+                            uint64_t sum_ids = 0;
+                            for (size_t k = 0; k < cur_len; ++k) sum_ids += cur_buf[k];
+                            append_uint(out_str, cur_len); out_str.push_back(' ');
+                            append_uint(out_str, sum_ids);
+                            size_t emit_count = std::min(cur_len, (size_t)10);
+                            for (size_t k = 0; k < emit_count; ++k) { out_str.push_back(' '); append_uint(out_str, cur_buf[k]); }
+                            out_str.push_back('\n');
                         }
-                        append_uint(out_str, cur_len);
-                        out_str.push_back(' ');
-                        append_uint(out_str, sum_ids);
-
-                        size_t emit_count = std::min(cur_len, (size_t)10);
-                        for (size_t k = 0; k < emit_count; ++k) {
-                            out_str.push_back(' ');
-                            append_uint(out_str, cur_buf[k]);
-                        }
-                        out_str.push_back('\n');
                     }
                 } else if (qline.starts_with("PHRASE \"")) {
-                    std::string_view inner = qline.substr(8);
-                    if (!inner.empty() && inner.back() == '"') inner.remove_suffix(1);
-
-                    size_t num_phrase_terms = 0, pos = 0;
-                    size_t min_phrase_len = 0;
-                    while (pos < inner.size() && num_phrase_terms < 32) {
-                        while (pos < inner.size() && inner[pos] == ' ') pos++;
-                        if (pos >= inner.size()) break;
-                        size_t next_sp = inner.find(' ', pos);
-                        if (next_sp == std::string_view::npos) next_sp = inner.size();
-                        std::string_view w = inner.substr(pos, next_sp - pos);
+                    std::string_view in = qline.substr(8);
+                    if (!in.empty() && in.back() == '"') in.remove_suffix(1);
+                    size_t num_phrase_terms = 0, pos = 0, min_phrase_len = 0;
+                    while (pos < in.size() && num_phrase_terms < 32) {
+                        while (pos < in.size() && in[pos] == ' ') pos++;
+                        if (pos >= in.size()) break;
+                        size_t sp = in.find(' ', pos);
+                        if (sp == std::string_view::npos) sp = in.size();
+                        std::string_view w = in.substr(pos, sp - pos);
                         min_phrase_len += w.size();
                         phrase_terms[num_phrase_terms++] = w;
-                        pos = next_sp;
+                        pos = sp;
                     }
+                    if (!num_phrase_terms) { out_str.append("0 0\n"); continue; }
 
-                    if (num_phrase_terms == 0) {
-                        out_str.append("0 0\n");
-                        continue;
-                    }
-
-                    struct PhraseTermInfo {
-                        size_t term_idx;
-                        size_t len;
-                        int64_t tok_id;
-                    };
-                    PhraseTermInfo pinfo[32];
-                    bool missing = false;
-
+                    struct PhraseTermInfo { size_t term_idx, len; int64_t tok_id; };
+                    PhraseTermInfo pinfo[32]; bool missing = false;
                     for (size_t i = 0; i < num_phrase_terms; ++i) {
                         int64_t tid_val = find_token(phrase_terms[i]);
-                        if (tid_val < 0 || (size_t)tid_val >= num_active_tokens) {
-                            missing = true;
-                            break;
-                        }
-                        uint32_t start = csr_offsets[tid_val];
-                        uint32_t end = csr_offsets[tid_val + 1];
-                        uint32_t plen = end - start;
-                        if (plen == 0) {
-                            missing = true;
-                            break;
-                        }
+                        if (tid_val < 0 || (size_t)tid_val >= num_active_tokens) { missing = true; break; }
+                        uint32_t plen = token_df[tid_val];
+                        if (!plen) { missing = true; break; }
                         pinfo[i] = {i, plen, tid_val};
                     }
+                    if (missing) { out_str.append("0 0\n"); continue; }
 
-                    if (missing) {
-                        out_str.append("0 0\n");
-                        continue;
-                    }
-
-                    size_t k_lim = std::min(num_phrase_terms, (size_t)8);
-                    size_t pi[8] = {};
+                    size_t k_lim = std::min(num_phrase_terms, (size_t)8), pi[8] = {};
                     for (size_t i = 1, j = 0; i < k_lim; ++i) {
                         while (j > 0 && phrase_terms[i] != phrase_terms[j]) j = pi[j - 1];
                         if (phrase_terms[i] == phrase_terms[j]) ++j;
                         pi[i] = j;
                     }
+                    std::sort(pinfo, pinfo + num_phrase_terms, [](const auto& a, const auto& b) { return a.len < b.len; });
 
-                    std::sort(pinfo, pinfo + num_phrase_terms, [](const auto& a, const auto& b) {
-                        return a.len < b.len;
-                    });
-
-                    uint32_t* cur_cand = buf_a.get();
-                    uint32_t* next_cand = buf_b.get();
-
+                    uint32_t* cur_cand = buf_a.get(), *next_cand = buf_b.get();
                     uint32_t first_tok_id = pinfo[0].tok_id;
-                    uint32_t f_start = csr_offsets[first_tok_id];
-                    size_t cur_cand_len = pinfo[0].len;
-                    std::memcpy(cur_cand, csr_doc_ids.data() + f_start, cur_cand_len * sizeof(uint32_t));
+                    size_t cur_cand_len = 0;
+
+                    if (term_bitsets[first_tok_id]) {
+                        const uint64_t* bset = term_bitsets[first_tok_id];
+                        for (size_t w = 0; w < BITSET_WORDS; ++w) {
+                            uint64_t word = bset[w];
+                            uint32_t base_id = (uint32_t)w << 6;
+                            while (word) {
+                                cur_cand[cur_cand_len++] = base_id + (uint32_t)__builtin_ctzll(word);
+                                word &= word - 1;
+                            }
+                        }
+                    } else {
+                        uint32_t f_start = csr_offsets[first_tok_id];
+                        cur_cand_len = pinfo[0].len;
+                        std::memcpy(cur_cand, csr_doc_ids.data() + f_start, cur_cand_len * sizeof(uint32_t));
+                    }
 
                     for (size_t i = 1; i < num_phrase_terms && cur_cand_len > 0; ++i) {
                         if (pinfo[i].tok_id == pinfo[i - 1].tok_id) continue;
-
                         uint32_t t_id = pinfo[i].tok_id;
                         const uint64_t* p_bitset = term_bitsets[t_id];
                         size_t next_len = 0;
-
                         if (p_bitset) {
                             for (size_t k = 0; k < cur_cand_len; ++k) {
                                 uint32_t doc = cur_cand[k];
-                                if ((p_bitset[doc >> 6] & (1ULL << (doc & 63))) != 0) {
-                                    next_cand[next_len++] = doc;
-                                }
+                                if (p_bitset[doc >> 6] & (1ULL << (doc & 63))) next_cand[next_len++] = doc;
                             }
                         } else {
                             uint32_t start = csr_offsets[t_id];
                             size_t post_len = pinfo[i].len;
-                            if (cur_cand_len * 8 < post_len) {
-                                next_len = intersect_small_large(cur_cand, cur_cand_len, csr_doc_ids.data() + start, post_len, next_cand);
-                            } else {
-                                next_len = setop<true, false, false>(cur_cand, cur_cand_len, csr_doc_ids.data() + start, post_len, next_cand);
-                            }
+                            if (cur_cand_len * 8 < post_len) next_len = intersect_small_large(cur_cand, cur_cand_len, csr_doc_ids.data() + start, post_len, next_cand);
+                            else next_len = setop<true, false, false>(cur_cand, cur_cand_len, csr_doc_ids.data() + start, post_len, next_cand);
                         }
-                        cur_cand_len = next_len;
-                        std::swap(cur_cand, next_cand);
+                        cur_cand_len = next_len; std::swap(cur_cand, next_cand);
                     }
 
-                    matches.clear();
-                    uint64_t sum_ids = 0;
-
+                    matches.clear(); uint64_t sum_ids = 0;
                     for (size_t k = 0; k < cur_cand_len; ++k) {
                         uint32_t doc_id = cur_cand[k];
                         if (doc_id < MAX_DOCS) {
                             const auto& span = doc_spans[doc_id];
                             if (span.len >= min_phrase_len) {
-                                const char* s = docs_data + span.off;
-                                const char* e = s + span.len;
-                                if (match_phrase_kmp_fast(s, e, phrase_terms, pi, k_lim)) {
-                                    matches.push_back(doc_id);
-                                    sum_ids += doc_id;
+                                if (match_phrase_kmp_fast(docs_data + span.off, docs_data + span.off + span.len, phrase_terms, pi, k_lim)) {
+                                    matches.push_back(doc_id); sum_ids += doc_id;
                                 }
                             }
                         }
                     }
 
-                    if (matches.empty()) {
-                        out_str.append("0 0\n");
-                    } else {
-                        append_uint(out_str, matches.size());
-                        out_str.push_back(' ');
+                    if (matches.empty()) { out_str.append("0 0\n"); }
+                    else {
+                        append_uint(out_str, matches.size()); out_str.push_back(' ');
                         append_uint(out_str, sum_ids);
-
                         size_t emit_count = std::min(matches.size(), (size_t)10);
-                        for (size_t k = 0; k < emit_count; ++k) {
-                            out_str.push_back(' ');
-                            append_uint(out_str, matches[k]);
-                        }
+                        for (size_t k = 0; k < emit_count; ++k) { out_str.push_back(' '); append_uint(out_str, matches[k]); }
                         out_str.push_back('\n');
                     }
                 }
             }
         });
     }
-
     for (auto& w : workers) w.join();
 
 #ifdef _WIN32
     CreateDirectoryA(out_dir.c_str(), NULL);
 #endif
-
-    FILE* fp = fopen(results_path.c_str(), "wb");
+    FILE* fp = fopen((out_dir + "/results.txt").c_str(), "wb");
     if (!fp) return 1;
-
-    // Discarded OutBuf: direct fwrite per thread output
-    for (unsigned tid = 0; tid < num_threads; ++tid) {
-        fwrite(thread_outputs[tid].data(), 1, thread_outputs[tid].size(), fp);
-    }
+    for (unsigned tid = 0; tid < num_threads; ++tid) fwrite(thread_outputs[tid].data(), 1, thread_outputs[tid].size(), fp);
     fclose(fp);
 
 #ifndef _WIN32
     _exit(0);
 #endif
-
     return 0;
 }
