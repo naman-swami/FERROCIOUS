@@ -1,18 +1,13 @@
-// Track B: boolean and phrase queries over a text corpus. C++20, no deps.
-// Step 10: Bit-parallel AVX2 tokenizer, prefetched vocabulary lookups,
-// doc offsets only, term-length filter in phrase verification, symmetric galloping.
-#include <algorithm>
-#include <atomic>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <fcntl.h>
-#include <immintrin.h>
-#include <memory>
+#include <iostream>
+#include <vector>
 #include <string>
 #include <string_view>
+#include <cstring>
+#include <cstdint>
+#include <algorithm>
 #include <thread>
-#include <vector>
+#include <memory>
+#include <immintrin.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -29,6 +24,20 @@ constexpr size_t CAP = 1 << 18;
 struct Slot { uint64_t key; uint32_t id; };
 Slot tab[CAP];
 uint32_t nact;
+
+static uint64_t bloom_bits[4096];
+inline void bloom_set(uint64_t h) {
+  bloom_bits[(h & 0x3FFFF) >> 6] |= (1ULL << (h & 63));
+  uint64_t h2 = h * 0x517cc1b727220a95ull;
+  bloom_bits[(h2 & 0x3FFFF) >> 6] |= (1ULL << (h2 & 63));
+}
+inline bool bloom_test(uint64_t h) {
+  uint64_t mask1 = 1ULL << (h & 63);
+  if ((bloom_bits[(h & 0x3FFFF) >> 6] & mask1) == 0) return false;
+  uint64_t h2 = h * 0x517cc1b727220a95ull;
+  uint64_t mask2 = 1ULL << (h2 & 63);
+  return (bloom_bits[(h2 & 0x3FFFF) >> 6] & mask2) != 0;
+}
 
 sv map_file(const std::string &path) {
 #ifdef _WIN32
@@ -70,6 +79,7 @@ inline uint64_t key_of(const char *s, size_t n, const char *end) {
 }
 inline size_t slot_of(uint64_t k) { return k * 0x9E3779B97F4A7C15ull >> 46; }
 uint32_t add(uint64_t k) {
+  bloom_set(k);
   size_t s = slot_of(k);
   for (; tab[s].key; s = (s + 1) & (CAP - 1))
     if (tab[s].key == k) return tab[s].id;
@@ -138,6 +148,7 @@ template <class F> uint32_t scan_chunk(sv file, const char *cur, const char *lim
     unsigned c = 0;
     scan_line(cur, le, end, [&](const char *s, size_t len) {
       uint64_t k = key_of(s, len, end);
+      if (!bloom_test(k)) return;
       size_t sl = slot_of(k), i = c++ & 15;
       __builtin_prefetch(&tab[sl]);
       if (c > 16) look(rk[i], rs[i]);
@@ -212,6 +223,12 @@ size_t split(sv l, sv *w) {
   }
   return n;
 }
+
+inline void append_u64(std::string &s, uint64_t v) {
+  char buf[24]; int k = 0;
+  do { buf[k++] = char('0' + (v % 10)); v /= 10; } while (v);
+  while (k) s.push_back(buf[--k]);
+}
 } // namespace
 
 int main(int argc, char **argv) {
@@ -230,8 +247,7 @@ int main(int argc, char **argv) {
     sv w[32];
     size_t n = split(lines.back(), w);
     for (size_t i = 1; i < n; ++i)
-      if (w[i] != "AND" && w[i] != "OR" && w[i] != "NOT")
-        add(key_of(w[i].data(), w[i].size(), qend));
+      if (w[i] != "AND" && w[i] != "OR" && w[i] != "NOT") add(key_of(w[i].data(), w[i].size(), qend));
   }
 
   std::vector<const char *> cs(T + 1, dend);
@@ -242,18 +258,17 @@ int main(int argc, char **argv) {
     cs[i] = p ? p + 1 : dend;
   }
 
-  std::vector<uint32_t> cnt((size_t)T * nact), ndoc(T);
+    std::vector<uint32_t> cnt((size_t)T * nact), ndoc(T);
   run(T, [&](unsigned t) {
     std::vector<uint32_t> seen(nact, ~0u);
     uint32_t *c = cnt.data() + (size_t)t * nact;
-    ndoc[t] = scan_chunk(docs, cs[t], cs[t + 1], nullptr,
-                         [&](uint32_t d, uint32_t k) {
-                           if (seen[k] != d) { seen[k] = d; ++c[k]; }
-                         });
+    ndoc[t] = scan_chunk(docs, cs[t], cs[t + 1], nullptr, [&](uint32_t d, uint32_t k) {
+      if (seen[k] != d) { seen[k] = d; ++c[k]; }
+    });
   });
   size_t N = *std::max_element(ndoc.begin(), ndoc.end());
 
-  std::vector<uint32_t> offs(nact + 1);
+    std::vector<uint32_t> offs(nact + 1);
   uint32_t tot = 0;
   for (uint32_t k = 0; k < nact; ++k) {
     offs[k] = tot;
@@ -265,7 +280,7 @@ int main(int argc, char **argv) {
   }
   offs[nact] = tot;
 
-  auto csr = std::make_unique_for_overwrite<uint32_t[]>(tot);
+    auto csr = std::make_unique_for_overwrite<uint32_t[]>(tot);
   auto off = std::make_unique_for_overwrite<uint32_t[]>(N);
   run(T, [&](unsigned t) {
     std::vector<uint32_t> seen(nact, ~0u);
@@ -275,7 +290,7 @@ int main(int argc, char **argv) {
     });
   });
 
-  size_t W = (N + 63) / 64, thr = N / 32 + 1, nb = 0;
+    size_t W = (N + 63) / 64, thr = N / 32 + 1, nb = 0;
   for (uint32_t k = 0; k < nact; ++k) nb += offs[k + 1] - offs[k] >= thr;
   uint64_t *arena = (uint64_t *)calloc(nb * W + 1, 8), *nbs = arena;
   std::vector<uint64_t *> bs(nact, nullptr);
@@ -287,7 +302,7 @@ int main(int argc, char **argv) {
         bs[k][csr[i] >> 6] |= 1ull << (csr[i] & 63);
   });
 
-  auto answer = [&](sv line, std::string &o, uint32_t *buf0, uint32_t *buf1) {
+    auto answer = [&](sv line, std::string &o, uint32_t *buf0, uint32_t *buf1) {
     sv w[32];
     size_t n = split(line, w);
     const uint32_t *cur = nullptr;
@@ -318,8 +333,7 @@ int main(int argc, char **argv) {
         pi[i] = j += tk[i] == tk[j];
       }
       std::sort(ord, ord + k, [&](size_t a, size_t b) { return ps[a].n < ps[b].n; });
-      cur = ps[ord[0]].d;
-      cn = ps[ord[0]].n;
+      cur = ps[ord[0]].d; cn = ps[ord[0]].n;
       for (size_t i = 1; i < k && cn; ++i) {
         cn = inter(cur, cn, ps[ord[i]], dst);
         cur = dst;
@@ -339,12 +353,10 @@ int main(int argc, char **argv) {
         });
         if (j == k) dst[m++] = cur[c];
       }
-      cur = dst;
-      cn = m;
+      cur = dst; cn = m;
     } else if (n > 1) {
       Post p = post(w[1]);
-      cur = p.d;
-      cn = p.n;
+      cur = p.d; cn = p.n;
       for (size_t i = 2; i + 1 < n; i += 2) {
         Post q = post(w[i + 1]);
         size_t m;
@@ -357,8 +369,7 @@ int main(int argc, char **argv) {
           if (!cn || !q.n) continue;
           m = q.b ? filt<false>(cur, cn, q.b, dst) : setop<0, 1, 0>(cur, cn, q.d, q.n, dst);
         }
-        cur = dst;
-        cn = m;
+        cur = dst; cn = m;
         std::swap(dst, alt);
       }
     }
@@ -367,53 +378,41 @@ int main(int argc, char **argv) {
     size_t i = 0;
     __m256i vsum = _mm256_setzero_si256();
     for (; i + 8 <= cn; i += 8) {
-      __m256i v = _mm256_loadu_si256((const __m256i*)(cur + i));
+      __m256i v = _mm256_loadu_si256((const __m256i *)(cur + i));
       __m256i lo = _mm256_cvtepu32_epi64(_mm256_castsi256_si128(v));
       __m256i hi = _mm256_cvtepu32_epi64(_mm256_extracti128_si256(v, 1));
       vsum = _mm256_add_epi64(vsum, _mm256_add_epi64(lo, hi));
     }
-    alignas(32) uint64_t r[4];
-    _mm256_storeu_si256((__m256i*)r, vsum);
-    sum = r[0] + r[1] + r[2] + r[3];
+    alignas(32) uint64_t sarr[4];
+    _mm256_storeu_si256((__m256i *)sarr, vsum);
+    sum = sarr[0] + sarr[1] + sarr[2] + sarr[3];
     for (; i < cn; ++i) sum += cur[i];
-
-    auto append_u64 = [&](uint64_t v) {
-      char tmp[24]; int k = 0;
-      do { tmp[k++] = char('0' + v % 10); v /= 10; } while (v);
-      while (k) o.push_back(tmp[--k]);
-    };
-
-    append_u64(cn); o.push_back(' ');
-    append_u64(sum);
+    append_u64(o, cn); o.push_back(' ');
+    append_u64(o, sum);
     for (size_t j = 0; j < std::min<size_t>(cn, 10); ++j) {
       o.push_back(' ');
-      append_u64(cur[j]);
+      append_u64(o, cur[j]);
     }
     o.push_back('\n');
   };
 
-  constexpr size_t BLK = 128;
-  size_t nblk = (lines.size() + BLK - 1) / BLK;
-  std::vector<std::string> res(nblk);
-  for (auto &r : res) r.reserve(BLK * 64);
-  std::atomic<size_t> next{0};
-  run(T, [&](unsigned) {
-    auto b0 = std::make_unique_for_overwrite<uint32_t[]>(N + 1);
-    auto b1 = std::make_unique_for_overwrite<uint32_t[]>(N + 1);
-    for (size_t b; (b = next++) < nblk;)
-      for (size_t q = b * BLK; q < std::min(lines.size(), (b + 1) * BLK); ++q)
-        answer(lines[q], res[b], b0.get(), b1.get());
+  std::vector<std::string> outs(T);
+  size_t nq = lines.size();
+  run(T, [&](unsigned t) {
+    size_t s = nq * t / T, e = nq * (t + 1) / T;
+    std::string &o = outs[t];
+    o.reserve((e - s) * 48);
+    auto b0 = std::make_unique<uint32_t[]>(N);
+    auto b1 = std::make_unique<uint32_t[]>(N);
+    for (size_t i = s; i < e; ++i) answer(lines[i], o, b0.get(), b1.get());
   });
 
-#ifdef _WIN32
-  CreateDirectoryA(out.c_str(), NULL);
-#endif
-  FILE *fp = fopen((out + "/results.txt").c_str(), "wb");
-  if (!fp) return 1;
-  for (auto &r : res) fwrite(r.data(), 1, r.size(), fp);
-  fclose(fp);
-
-#ifndef _WIN32
+    
+  FILE *f = fopen((out + "/results.txt").c_str(), "wb");
+  if (!f) return 1;
+  for (unsigned t = 0; t < T; ++t) fwrite(outs[t].data(), 1, outs[t].size(), f);
+  fclose(f);
+  #ifndef _WIN32
   _exit(0);
 #endif
   return 0;

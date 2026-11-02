@@ -13,7 +13,6 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <direct.h>
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -22,11 +21,8 @@
 #endif
 
 namespace {
-
 struct OutBuf {
-    FILE* f;
-    std::vector<char> b;
-    size_t n = 0;
+    FILE* f; std::vector<char> b; size_t n = 0;
     explicit OutBuf(FILE* f) : f(f), b(1 << 20) {}
     ~OutBuf() { flush(); }
     void flush() { if (n && f) { fwrite(b.data(), 1, n, f); n = 0; } }
@@ -40,9 +36,7 @@ struct OutBuf {
 };
 
 struct MappedFile {
-    void*  data = nullptr;
-    size_t size = 0;
-    bool   ok   = false;
+    void* data = nullptr; size_t size = 0; bool ok = false;
 #ifdef _WIN32
     HANDLE hFile = INVALID_HANDLE_VALUE, hMap = NULL;
     explicit MappedFile(const char* p) {
@@ -87,23 +81,20 @@ struct CountryStats {
 
 inline void format_cents(int64_t cents, OutBuf& out) {
     if (cents < 0) { out.put('-'); cents = -cents; }
-    out.u64(cents / 100);
-    out.put('.');
+    out.u64(cents / 100); out.put('.');
     int rem = cents % 100;
-    out.put('0' + (rem / 10));
-    out.put('0' + (rem % 10));
+    out.put('0' + (rem / 10)); out.put('0' + (rem % 10));
 }
 
 inline int64_t parse_cents_fast(const char* p, const char* end) {
-    bool neg = (*p == '-');
-    p += neg;
+    bool neg = (*p == '-'); p += neg;
     int64_t w = 0;
     while (p < end && (unsigned)(*p - '0') <= 9) w = w * 10 + (*p++ - '0');
     int64_t f = 0;
     if (p < end && *p == '.') {
-        p++;
-        if (p < end && (unsigned)(*p - '0') <= 9) f = (*p++ - '0') * 10;
-        if (p < end && (unsigned)(*p - '0') <= 9) f += (*p++ - '0');
+        ++p;
+        if (p < end) f = (*p++ - '0') * 10;
+        if (p < end) f += (*p++ - '0');
     }
     int64_t total = w * 100 + f;
     return neg ? -total : total;
@@ -158,9 +149,10 @@ inline uint32_t get_or_register_name_fast(const char* s, size_t len, uint64_t h)
 }
 
 struct NCache {
-    static constexpr unsigned N = 16384, M = N - 1;
-    uint64_t h[N]{};
-    uint32_t len[N]{}, id[N]{};
+    static constexpr unsigned N = 32768, M = N - 1;
+    uint64_t h[N];
+    uint32_t len[N], id[N];
+    NCache() { memset(h, 0, sizeof h); }
     template <class F>
     inline uint32_t lookup(uint64_t hv, uint32_t n, F&& miss) {
         unsigned i = (unsigned)hv & M;
@@ -173,7 +165,6 @@ struct NCache {
 
 static constexpr size_t BITSET_WORDS = 2048;
 static uint16_t region_to_country[1000000];
-
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -248,6 +239,7 @@ int main(int argc, char* argv[]) {
     constexpr size_t CHUNK_SIZE = 256 * 1024;
     size_t num_chunks = (total_size - data_start + CHUNK_SIZE - 1) / CHUNK_SIZE;
     std::atomic<uint32_t> next_chunk{0};
+
     std::vector<CountryStats> thread_stats(num_threads * num_countries);
 
     std::vector<std::thread> workers;
@@ -255,7 +247,7 @@ int main(int argc, char* argv[]) {
         workers.emplace_back([&, tid]() {
             CountryStats* stats = &thread_stats[tid * num_countries];
             char unescape_buf[512];
-            NCache ncache;
+            auto ncache = std::make_unique<NCache>();
 
             while (true) {
                 uint32_t c = next_chunk.fetch_add(1, std::memory_order_relaxed);
@@ -359,7 +351,14 @@ int main(int argc, char* argv[]) {
                                     if (ne > ns) {
                                         uint64_t raw_len = (uint64_t)(ne - ns);
                                         uint32_t q_cnt = 0;
-                                        for (const char* cp = ns; cp < ne; ++cp) if (*cp == '"') q_cnt++;
+                                        const char* cp = ns;
+                                        while (cp + 32 <= ne) {
+                                            __m256i v = _mm256_loadu_si256((const __m256i*)cp);
+                                            uint32_t m = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8('"')));
+                                            q_cnt += (uint32_t)std::popcount(m);
+                                            cp += 32;
+                                        }
+                                        while (cp < ne) if (*cp++ == '"') q_cnt++;
                                         note_len = raw_len - (q_cnt / 2);
                                     }
                                 } else {
@@ -383,7 +382,7 @@ int main(int argc, char* argv[]) {
                                 cs.note_bytes += note_len;
 
                                 uint64_t nh = hash_bytes_fast(name_ptr, name_len);
-                                uint32_t nid = ncache.lookup(nh, name_len, [&]() {
+                                uint32_t nid = ncache->lookup(nh, name_len, [&]() {
                                     return get_or_register_name_fast(name_ptr, name_len, nh);
                                 });
 

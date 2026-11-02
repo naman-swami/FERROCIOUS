@@ -31,7 +31,7 @@
 namespace {
 
 constexpr unsigned kHours = 72;
-constexpr size_t kChunk = 128 * 1024;
+constexpr size_t kChunk = 1024 * 1024;
 constexpr uint32_t kBlock = 1024;
 constexpr size_t kWin = 16384;
 constexpr unsigned kMaxThreads = 12;
@@ -510,7 +510,7 @@ int main(int argc, char** argv) {
     auto work = [&](unsigned tid) {
         Worker& w = g_workers[tid];
         w.init();
-        alignas(64) char chunk_buf[kChunk + 4096];
+        auto chunk_buf_ptr = std::make_unique<char[]>(kChunk + 4096); char* chunk_buf = chunk_buf_ptr.get();
         for (;;) {
             size_t c = next_chunk.fetch_add(1, std::memory_order_relaxed);
             if (c >= nchunks) break;
