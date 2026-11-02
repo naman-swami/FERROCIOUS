@@ -526,13 +526,15 @@ int main(int argc, char** argv) {
         }
     });
 
-    auto chunk_start = [&](size_t c) -> size_t {
-        if (c == 0) return 0;
+    std::vector<size_t> chunk_offsets(nchunks + 1, 0);
+    chunk_offsets[0] = 0;
+    chunk_offsets[nchunks] = total;
+    for (size_t c = 1; c < nchunks; ++c) {
         size_t pos = c * kChunk;
-        if (pos >= total) return total;
-        const void* nl = memchr(data + pos, '\n', total - pos);
-        return nl ? (size_t)((const char*)nl - data) + 1 : total;
-    };
+        size_t rem = std::min<size_t>(total - pos, 256);
+        const void* nl = memchr(data + pos, '\n', rem);
+        chunk_offsets[c] = nl ? (size_t)((const char*)nl - data) + 1 : total;
+    }
 
     auto work = [&](unsigned tid) {
         Worker& w = g_workers[tid];
@@ -540,7 +542,7 @@ int main(int argc, char** argv) {
         for (;;) {
             size_t c = next_chunk.fetch_add(1, std::memory_order_relaxed);
             if (c >= nchunks) break;
-            size_t s = chunk_start(c), e = chunk_start(c + 1);
+            size_t s = chunk_offsets[c], e = chunk_offsets[c + 1];
             if (s < e) w.scan(data + s, data + e);
         }
         bar.arrive_and_wait();
