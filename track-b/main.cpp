@@ -26,20 +26,6 @@ struct Slot { uint64_t key; uint32_t id; };
 Slot tab[CAP];
 uint32_t nact;
 
-static uint64_t bloom_bits[4096];
-inline void bloom_set(uint64_t h) {
-  bloom_bits[(h & 0x3FFFF) >> 6] |= (1ULL << (h & 63));
-  uint64_t h2 = h * 0x517cc1b727220a95ull;
-  bloom_bits[(h2 & 0x3FFFF) >> 6] |= (1ULL << (h2 & 63));
-}
-inline bool bloom_test(uint64_t h) {
-  uint64_t mask1 = 1ULL << (h & 63);
-  if ((bloom_bits[(h & 0x3FFFF) >> 6] & mask1) == 0) return false;
-  uint64_t h2 = h * 0x517cc1b727220a95ull;
-  uint64_t mask2 = 1ULL << (h2 & 63);
-  return (bloom_bits[(h2 & 0x3FFFF) >> 6] & mask2) != 0;
-}
-
 sv map_file(const std::string &path) {
 #ifdef _WIN32
   HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
@@ -80,7 +66,6 @@ inline uint64_t key_of(const char *s, size_t n, const char *end) {
 }
 inline size_t slot_of(uint64_t k) { return k * 0x9E3779B97F4A7C15ull >> 46; }
 uint32_t add(uint64_t k) {
-  bloom_set(k);
   size_t s = slot_of(k);
   for (; tab[s].key; s = (s + 1) & (CAP - 1))
     if (tab[s].key == k) return tab[s].id;
@@ -149,7 +134,6 @@ template <class F> uint32_t scan_chunk(sv file, const char *cur, const char *lim
     unsigned c = 0;
     scan_line(cur, le, end, [&](const char *s, size_t len) {
       uint64_t k = key_of(s, len, end);
-      if (!bloom_test(k)) return;
       size_t sl = slot_of(k), i = c++ & 15;
       __builtin_prefetch(&tab[sl]);
       if (c > 16) look(rk[i], rs[i]);

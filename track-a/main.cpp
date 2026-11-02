@@ -1,3 +1,13 @@
+// FERROCIOUS - Track A (Ingest). C++20, standard library only, no third-party dependencies.
+//
+// Pipeline (threads are spawned once and reused):
+//   phase 1  dynamic 128 KB chunks of the mmap'd log. Newlines are indexed 16 KB at a time with AVX2, then every
+//            line is decoded independently (hour, endpoint id, error flag, latency) and appended as a 4-byte
+//            record to a per-thread, per-hour block list. Nothing is sorted or counted here.
+//   barrier  endpoints are sorted alphabetically once.
+//   phase 2  dynamic hours: gather the hour's records from every thread and radix-sort them by (endpoint, latency)
+//            (everything stays in L2), take nearest-rank percentiles, format the text and stream finished hours
+//            to summary.txt strictly in hour order.
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -22,6 +32,7 @@
 #include <io.h>
 #include <direct.h>
 #else
+#include <sys/mman.h>
 #include <unistd.h>
 #endif
 
@@ -32,8 +43,8 @@ namespace {
 
 constexpr unsigned kHours = 72;
 constexpr size_t kChunk = 1024 * 1024;
-constexpr uint32_t kBlock = 1024;
-constexpr size_t kWin = 16384;
+constexpr uint32_t kBlock = 1024;   // records per bucket block (4 KB)
+constexpr size_t kWin = 16384;      // bytes indexed for newlines per window (stays in L1)
 constexpr unsigned kMaxThreads = 12;
 
 inline uint64_t rd8(const char* p) { uint64_t w; memcpy(&w, p, 8); return w; }
@@ -44,28 +55,15 @@ inline uint64_t mum(uint64_t a, uint64_t b) {
 }
 
 inline uint64_t hash_ep(const char* p, uint32_t len) {
-    constexpr uint64_t S0 = 0xA0761D6478BD642FULL, S1 = 0xE7037ED1A0B428DBULL;
-    uint64_t seed = S0 ^ len, a, b;
-    if (LIKELY(len >= 16)) {
-        const char* q = p;
-        uint32_t i = len;
-        while (i > 16) { seed = mum(rd8(q) ^ S1, seed ^ rd8(q + 8)); q += 8; i -= 8; }
-        a = rd8(p + len - 16); b = rd8(p + len - 8);
-    } else if (len >= 8) {
-        a = rd8(p); b = rd8(p + len - 8);
-    } else if (len >= 4) {
-        a = rd4(p); b = rd4(p + len - 4);
-    } else if (len > 0) {
-        uint8_t c0 = (uint8_t)p[0], c1 = (uint8_t)p[len >> 1], c2 = (uint8_t)p[len - 1];
-        a = ((uint32_t)c0 << 16) | ((uint32_t)c1 << 8) | c2; b = 0;
-    } else { a = b = 0; }
-    return mum(mum(a ^ S0, b ^ seed), S1);
+    uint64_t h = len;
+    while (len >= 8) { uint64_t v; memcpy(&v, p, 8); h = _mm_crc32_u64(h, v); p += 8; len -= 8; }
+    if (len >= 4) { uint32_t v; memcpy(&v, p, 4); h = _mm_crc32_u32((uint32_t)h, v); p += 4; len -= 4; }
+    while (len > 0) { h = _mm_crc32_u8((uint32_t)h, (uint8_t)*p++); len--; }
+    return h ? h : 1;
 }
 
 std::mutex g_mu;
 std::unordered_map<std::string_view, uint32_t> g_map;
-static char g_ep_arena[256 * 1024];
-static size_t g_ep_arena_len = 0;
 std::vector<std::string_view> g_eps;
 
 struct Slot { uint64_t h; uint32_t len, gid; };
@@ -79,45 +77,41 @@ struct Worker {
     std::vector<uint32_t*> blocks[kHours];
     uint32_t *bump = nullptr, *bump_end = nullptr;
     std::vector<Spill> spill;
-    const char* nlv[kWin];
+    const char** nlv = nullptr;
 
     void init() {
-        constexpr uint32_t kInit = 256;
-        mask = kInit - 1;
-        tbl = (Slot*)calloc(kInit, sizeof(Slot));
-        memset(cur, 0, sizeof cur);
-        memset(lim, 0, sizeof lim);
+        nlv = (const char**)malloc((kWin + 80) * sizeof(char*));
+        mask = 4095;
+        tbl = (Slot*)calloc(mask + 1, sizeof(Slot));
+        for (unsigned h = 0; h < kHours; ++h) cur[h] = lim[h] = nullptr;
     }
 
     void grow() {
-        uint32_t old_cap = mask + 1, new_cap = old_cap * 2;
-        Slot* old_tbl = tbl;
-        tbl = (Slot*)calloc(new_cap, sizeof(Slot));
-        mask = new_cap - 1;
-        for (uint32_t i = 0; i < old_cap; ++i) {
-            if (!old_tbl[i].h) continue;
-            uint32_t j = (uint32_t)old_tbl[i].h & mask;
-            while (tbl[j].h) j = (j + 1) & mask;
-            tbl[j] = old_tbl[i];
-        }
-        free(old_tbl);
+        uint32_t ncap = (mask + 1) * 2;
+        Slot* nt = (Slot*)calloc(ncap, sizeof(Slot));
+        for (uint32_t i = 0; i <= mask; ++i)
+            if (tbl[i].h) {
+                uint32_t j = (uint32_t)tbl[i].h & (ncap - 1);
+                while (nt[j].h) j = (j + 1) & (ncap - 1);
+                nt[j] = tbl[i];
+            }
+        free(tbl);
+        tbl = nt;
+        mask = ncap - 1;
     }
 
     __attribute__((noinline)) uint32_t insert(const char* ep, uint32_t len, uint64_t h) {
         uint32_t gid;
         {
             std::lock_guard<std::mutex> lk(g_mu);
-            auto it = g_map.find(std::string_view(ep, len));
-            if (it == g_map.end()) {
-                char* copy_ptr = g_ep_arena + g_ep_arena_len;
-                memcpy(copy_ptr, ep, len);
-                g_ep_arena_len += len;
-                std::string_view permanent_key(copy_ptr, len);
-                gid = (uint32_t)g_eps.size();
-                g_eps.push_back(permanent_key);
-                g_map.emplace(permanent_key, gid);
-            } else {
+            std::string_view sv(ep, len);
+            auto it = g_map.find(sv);
+            if (it != g_map.end()) {
                 gid = it->second;
+            } else {
+                gid = (uint32_t)g_eps.size();
+                g_eps.push_back(sv);
+                g_map.emplace(sv, gid);
             }
         }
         if ((count + 1) * 2 > mask + 1) grow();
@@ -133,7 +127,9 @@ struct Worker {
         uint32_t i = (uint32_t)h & mask;
         for (;;) {
             const Slot& s = tbl[i];
-            if (LIKELY(s.h == h && s.len == len)) return s.gid;
+            if (LIKELY(s.h == h && s.len == len)) {
+                return s.gid;
+            }
             if (s.h == 0) return insert(ep, len, h);
             i = (i + 1) & mask;
         }
@@ -175,86 +171,92 @@ struct Worker {
         uint64_t x = rd8(p + 5);
         uint64_t y = rd8(p + 28);
         uint64_t w = rd8(nl - 8);
+        uint32_t day = (uint32_t)((x >> 24) & 0xF) * 10 + (uint32_t)((x >> 32) & 0xF);
+        uint32_t hr = (uint32_t)((x >> 48) & 0xF) * 10 + (uint32_t)((x >> 56) & 0xF);
+        uint32_t hour = 24 * day + 744 * (uint32_t)((x >> 8) & 0xF) + hr - 738;
 
-        uint32_t d1 = (uint32_t)((x >> 24) & 0xFF) - '0';
-        uint32_t d2 = (uint32_t)((x >> 32) & 0xFF) - '0';
-        uint32_t day = d1 * 10 + d2;
-        uint32_t h1 = (uint32_t)((x >> 48) & 0xFF) - '0';
-        uint32_t h2 = (uint32_t)((x >> 56) & 0xFF) - '0';
-        uint32_t hr = h1 * 10 + h2;
-        uint32_t hour = (((uint32_t)(x >> 8) & 0xFF) == '0' ? day - 30 : day + 1) * 24 + hr - 18;
-        if (UNLIKELY(hour >= kHours)) return false;
+        uint64_t t = y ^ 0x2020202020202020ULL;
+        uint64_t z = (t - 0x0101010101010101ULL) & ~t & 0x8080808080808080ULL;
+        const char* ep = p + 28 + (__builtin_ctzll(z | (1ULL << 63)) >> 3) + 1;
 
-        const char* q = p + 28;
-        int mlen = (y & 0xFF) == ' ' ? 1 : ((y >> 8) & 0xFF) == ' ' ? 2 : ((y >> 16) & 0xFF) == ' ' ? 3 :
-                   ((y >> 24) & 0xFF) == ' ' ? 4 : ((y >> 32) & 0xFF) == ' ' ? 5 : ((y >> 40) & 0xFF) == ' ' ? 6 : -1;
-        if (UNLIKELY(mlen < 0)) return false;
-        q += mlen;
-        const char* ep = q;
-
-        int sh = (w >> 56) == ' ' ? 56 : (w >> 48) == ' ' ? 48 : (w >> 40) == ' ' ? 40 :
-                 (w >> 32) == ' ' ? 32 : (w >> 24) == ' ' ? 24 : (w >> 16) == ' ' ? 16 :
-                 (w >>  8) == ' ' ?  8 : (w & 0xFF) == ' ' ? 0 : -1;
-        if (UNLIKELY(sh < 0)) return false;
-        const char* sp = (nl - 8) + (sh / 8);
-        if (UNLIKELY(sp - 4 < ep)) return false;
+        uint64_t t2 = w ^ 0x2020202020202020ULL;
+        uint64_t z2 = ~(((t2 & 0x7F7F7F7F7F7F7F7FULL) + 0x7F7F7F7F7F7F7F7FULL) | t2 | 0x7F7F7F7F7F7F7F7FULL);
+        uint32_t idx = (63u - (uint32_t)__builtin_clzll(z2 | 1)) >> 3;
+        uint32_t nb = 7 - idx;
+        const char* sp = nl - 8 + idx;
         const char* ep_end = sp - 4;
-        uint32_t err = (sp[-3] == '5');
 
-        uint32_t lat = 0;
-        for (const char* t = sp + 1; t < nl; ++t) {
-            uint32_t dig = (uint32_t)(*t - '0');
-            if (UNLIKELY(dig > 9)) return false;
-            lat = lat * 10 + dig;
-        }
+        uint64_t region = ~0ULL << (((8 - nb) * 8) & 63);
+        uint64_t d = w ^ 0x3030303030303030ULL;
+        uint64_t digit_bad = ((d + 0x7676767676767676ULL) | d) & 0x8080808080808080ULL & region;
 
-        uint32_t gid = gid_of(ep, (uint32_t)(ep_end - ep));
-        put(hour, gid, err, lat);
+        if (UNLIKELY((p[27] != ' ') | (hour >= kHours) | (z == 0) | (z2 == 0) | (nb == 0) | (ep_end <= ep) |
+                     (*ep_end != ' ') | (digit_bad != 0)))
+            return false;
+
+        uint64_t v = w & region;
+        v = ((v & 0x0F0F0F0F0F0F0F0FULL) * 2561) >> 8;
+        v = ((v & 0x00FF00FF00FF00FFULL) * 6553601) >> 16;
+        v = ((v & 0x0000FFFF0000FFFFULL) * 42949672960001ULL) >> 32;
+
+        put(hour, gid_of(ep, (uint32_t)(ep_end - ep)), sp[-3] == '5', (uint32_t)v);
         return true;
     }
 
-    void slow_line(const char* p, const char* end) {
-        const char* nl = (const char*)memchr(p, '\n', end - p);
-        if (!nl) return;
-        const char* cur = p;
-        if (cur + 28 >= nl) return;
-        uint32_t day = (cur[8] - '0') * 10 + (cur[9] - '0');
-        uint32_t hr = (cur[11] - '0') * 10 + (cur[12] - '0');
-        uint32_t hour = (cur[6] == '0' ? day - 30 : day + 1) * 24 + hr - 18;
-        if (hour >= kHours) return;
-
-        const char* sp1 = (const char*)memchr(cur + 28, ' ', nl - (cur + 28));
-        if (!sp1) return;
-        const char* ep = sp1 + 1;
-        const char* sp2 = (const char*)memchr(ep, ' ', nl - ep);
-        if (!sp2) return;
-        uint32_t elen = (uint32_t)(sp2 - ep);
-
-        const char* sp3 = (const char*)memchr(sp2 + 1, ' ', nl - (sp2 + 1));
-        if (!sp3) return;
-        uint32_t err = (sp2[1] == '5');
-
+    const char* slow_line(const char* p, const char* end) {
+        const char* nl = (const char*)memchr(p, '\n', (size_t)(end - p));
+        const char* le = nl ? nl : end;
+        const char* next = nl ? nl + 1 : end;
+        if (le - p < 30) return next;
+        uint32_t day = (uint32_t)(p[8] - '0') * 10 + (uint32_t)(p[9] - '0');
+        uint32_t hr = (uint32_t)(p[11] - '0') * 10 + (uint32_t)(p[12] - '0');
+        uint32_t hour = ((p[6] == '0') ? day - 30 : day + 1) * 24 + hr - 18;
+        if (hour >= kHours) return next;
+        const char* a = p + 28;
+        const char* sp = (const char*)memchr(a, ' ', (size_t)(le - a));
+        if (!sp) return next;
+        const char* ep = sp + 1;
+        const char* es = (const char*)memchr(ep, ' ', (size_t)(le - ep));
+        if (!es) return next;
+        const char* s = es + 1;
+        if (s + 3 > le) return next;
+        uint32_t err = s[0] == '5';
+        s += 4;
         uint32_t lat = 0;
-        for (const char* t = sp3 + 1; t < nl; ++t) {
-            if (*t >= '0' && *t <= '9') lat = lat * 10 + (*t - '0');
-        }
-        uint32_t gid = gid_of(ep, elen);
-        put(hour, gid, err, lat);
+        while (s < le && (unsigned char)(*s - '0') <= 9) lat = lat * 10 + (uint32_t)(*s++ - '0');
+        put(hour, gid_of(ep, (uint32_t)(es - ep)), err, lat);
+        return next;
     }
 
-    static inline const char** index_block(const char* p, const char** o) {
-        __m256i v0 = _mm256_loadu_si256((const __m256i*)p);
-        __m256i v1 = _mm256_loadu_si256((const __m256i*)(p + 32));
-        __m256i m = _mm256_set1_epi8('\n');
-        uint32_t m0 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, m));
-        uint32_t m1 = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v1, m));
-        uint64_t mask = (uint64_t)m0 | ((uint64_t)m1 << 32);
-        while (mask) {
-            unsigned idx = __builtin_ctzll(mask);
-            *o++ = p + idx;
-            mask &= mask - 1;
+    static inline uint64_t nl_mask64(const char* b) {
+#ifdef __AVX2__
+        const __m256i n = _mm256_set1_epi8('\n');
+        uint32_t lo = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)b), n));
+        uint32_t hi = (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)(b + 32)), n));
+        return (uint64_t)lo | ((uint64_t)hi << 32);
+#else
+        const __m128i n = _mm_set1_epi8('\n');
+        uint64_t r = 0;
+        for (int i = 0; i < 4; ++i)
+            r |= (uint64_t)(uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(_mm_loadu_si128((const __m128i*)(b + 16 * i)), n)) << (16 * i);
+        return r;
+#endif
+    }
+
+    static inline const char** index_block(const char* b, const char** o) {
+        constexpr uint64_t kHi = 1ULL << 63;
+        uint64_t m = nl_mask64(b);
+        uint32_t cnt = (uint32_t)__builtin_popcountll(m);
+        o[0] = b + __builtin_ctzll(m | kHi); m &= m - 1;
+        o[1] = b + __builtin_ctzll(m | kHi); m &= m - 1;
+        o[2] = b + __builtin_ctzll(m | kHi); m &= m - 1;
+        o[3] = b + __builtin_ctzll(m | kHi); m &= m - 1;
+        if (UNLIKELY(cnt > 4)) {
+            o += 4;
+            while (m) { *o++ = b + __builtin_ctzll(m); m &= m - 1; }
+            return o;
         }
-        return o;
+        return o + cnt;
     }
 
     inline const char* run_lines(const char* line, size_t n) {
@@ -284,7 +286,7 @@ struct Worker {
             for (size_t i = 0; i < n; ++i) nlv[i] = b + (nlv[i] - tail);
             line = run_lines(line, n);
         }
-        while (line < e) slow_line(line, e), line = (const char*)memchr(line, '\n', e - line) ? (const char*)memchr(line, '\n', e - line) + 1 : e;
+        while (line < e) line = slow_line(line, e);
     }
 };
 
@@ -310,8 +312,12 @@ inline char* put_u32(char* o, uint32_t v) {
     return o + (10 - i);
 }
 
-char g_hour_str[kHours][32];
+
+
+char g_hour_str[kHours][24];
 std::vector<uint32_t> g_order;
+size_t g_max_hour_n = 0;
+size_t g_spill_n[kHours];
 
 struct HourOut { char* buf = nullptr; size_t len = 0; };
 HourOut g_out[kHours];
@@ -320,17 +326,17 @@ int g_out_fd = -1;
 void write_all(int fd, const char* b, size_t n) {
     while (n) {
 #ifdef _WIN32
-        int w = _write(fd, b, (unsigned)std::min<size_t>(n, 1 << 30));
+        int w = _write(fd, b, (unsigned int)n);
 #else
         ssize_t w = write(fd, b, n);
 #endif
-        if (w <= 0) break;
-        b += w; n -= (size_t)w;
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return;
+        }
+        b += w;
+        n -= (size_t)w;
     }
-}
-
-void publish(unsigned h, char* buf, size_t len) {
-    g_out[h] = HourOut{buf, len};
 }
 
 struct Scratch {
@@ -341,30 +347,20 @@ template <class F>
 inline void for_records(unsigned h, F&& f) {
     for (Worker& w : g_workers) {
         const auto& bl = w.blocks[h];
-        if (bl.empty()) continue;
-        size_t full = bl.size() - 1;
-        for (size_t i = 0; i < full; ++i) {
-            const uint32_t* p = bl[i];
-            for (uint32_t j = 0; j < kBlock; ++j) f(p[j]);
+        for (size_t j = 0, nb = bl.size(); j < nb; ++j) {
+            const uint32_t* r = bl[j];
+            size_t n = (j + 1 == nb) ? (size_t)(w.cur[h] - r) : kBlock;
+            for (size_t k = 0; k < n; ++k) f(r[k]);
         }
-        const uint32_t* p = bl[full];
-        const uint32_t* lim = w.cur[h];
-        while (p < lim) f(*p++);
     }
 }
 
 void process_hour(unsigned h, Scratch& sc) {
     const uint32_t G = (uint32_t)g_eps.size();
     if (sc.cnt.size() < G) { sc.cnt.resize(G); sc.err.resize(G); sc.pos.resize(G); sc.res.resize(3 * (size_t)G); }
-    size_t hour_recs = 0;
-    for (Worker& w : g_workers) hour_recs += w.hour_count(h) + w.spill.size();
-    if (sc.A.size() < hour_recs) sc.A.resize(hour_recs);
-
-    uint32_t* cnt = sc.cnt.data();
-    uint32_t* err = sc.err.data();
-    uint32_t* pos = sc.pos.data();
-    uint32_t* A = sc.A.data();
-
+    if (sc.A.size() < g_max_hour_n) { sc.A.resize(g_max_hour_n); }
+    uint32_t *cnt = sc.cnt.data(), *err = sc.err.data(), *pos = sc.pos.data();
+    uint32_t *A = sc.A.data();
     if (G) { memset(cnt, 0, G * 4); memset(err, 0, G * 4); }
 
     for_records(h, [&](uint32_t v) {
@@ -432,30 +428,8 @@ void process_hour(unsigned h, Scratch& sc) {
         o = put_u32(o, e);              *o++ = ' ';
         o = put_u32(o, (uint32_t)((uint64_t)e * 1000000ull / n)); *o++ = '\n';
     }
-    publish(h, buf, (size_t)(o - buf));
+    g_out[h] = HourOut{buf, (size_t)(o - buf)};
 }
-
-#ifdef _WIN32
-inline ssize_t my_pread(HANDLE hFile, void* buf, size_t count, size_t offset) {
-    OVERLAPPED ov = {0};
-    ov.Offset = (DWORD)(offset & 0xFFFFFFFF);
-    ov.OffsetHigh = (DWORD)(offset >> 32);
-    DWORD bytesRead = 0;
-    if (!ReadFile(hFile, buf, (DWORD)count, &bytesRead, &ov)) {
-        if (GetLastError() == ERROR_HANDLE_EOF) return 0;
-        if (GetLastError() == ERROR_IO_PENDING) {
-            if (!GetOverlappedResult(hFile, &ov, &bytesRead, TRUE)) return -1;
-            return (ssize_t)bytesRead;
-        }
-        return -1;
-    }
-    return (ssize_t)bytesRead;
-}
-#else
-inline ssize_t my_pread(int fd, void* buf, size_t count, size_t offset) {
-    return pread(fd, buf, count, offset);
-}
-#endif
 
 }  // namespace
 
@@ -463,13 +437,14 @@ int main(int argc, char** argv) {
     std::string dd = argc > 1 ? argv[1] : "/data", od = argc > 2 ? argv[2] : "/out";
     std::string in = dd + "/requests.log", outp = od + "/summary.txt";
 
-    size_t total = 0;
 #ifdef _WIN32
-    HANDLE hFile = CreateFileA(in.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    HANDLE hFile = CreateFileA(in.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
     if (hFile == INVALID_HANDLE_VALUE) return 1;
     LARGE_INTEGER liSize;
     GetFileSizeEx(hFile, &liSize);
-    total = (size_t)liSize.QuadPart;
+    size_t total = liSize.QuadPart;
+    HANDLE hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    const char* data = (const char*)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, total);
     _mkdir(od.c_str());
     g_out_fd = _open(outp.c_str(), _O_WRONLY | _O_CREAT | _O_TRUNC | _O_BINARY, 0666);
 #else
@@ -478,7 +453,14 @@ int main(int argc, char** argv) {
     if (fd < 0) return 1;
     struct stat st;
     if (fstat(fd, &st) != 0) return 1;
-    total = (size_t)st.st_size;
+    size_t total = (size_t)st.st_size;
+    const char* data = nullptr;
+    if (total) {
+        void* m = mmap(nullptr, total, PROT_READ, MAP_SHARED, fd, 0);
+        if (m == MAP_FAILED) return 1;
+        data = (const char*)m;
+    }
+    close(fd);
     g_out_fd = open(outp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
 #endif
 
@@ -505,39 +487,34 @@ int main(int argc, char** argv) {
         g_order.resize(G);
         for (uint32_t i = 0; i < G; ++i) g_order[i] = i;
         std::sort(g_order.begin(), g_order.end(), [](uint32_t a, uint32_t b) { return g_eps[a] < g_eps[b]; });
+        for (Worker& w : g_workers)
+            for (const Spill& s : w.spill) g_spill_n[s.hour]++;
+        g_max_hour_n = 0;
+        for (unsigned h = 0; h < kHours; ++h) {
+            size_t n = g_spill_n[h];
+            for (Worker& w : g_workers) n += w.hour_count(h);
+            g_max_hour_n = std::max(g_max_hour_n, n);
+        }
     });
+
+    std::vector<size_t> chunk_offsets(nchunks + 1, 0);
+    chunk_offsets[0] = 0;
+    chunk_offsets[nchunks] = total;
+    for (size_t c = 1; c < nchunks; ++c) {
+        size_t pos = c * kChunk;
+        size_t rem = std::min<size_t>(total - pos, 256);
+        const void* nl = memchr(data + pos, '\n', rem);
+        chunk_offsets[c] = nl ? (size_t)((const char*)nl - data) + 1 : total;
+    }
 
     auto work = [&](unsigned tid) {
         Worker& w = g_workers[tid];
         w.init();
-        auto chunk_buf_ptr = std::make_unique<char[]>(kChunk + 4096); char* chunk_buf = chunk_buf_ptr.get();
         for (;;) {
             size_t c = next_chunk.fetch_add(1, std::memory_order_relaxed);
             if (c >= nchunks) break;
-            size_t offset = c * kChunk;
-            size_t to_read = std::min(kChunk + 4096, total - offset);
-#ifdef _WIN32
-            ssize_t n = my_pread(hFile, chunk_buf, to_read, offset);
-#else
-            ssize_t n = my_pread(fd, chunk_buf, to_read, offset);
-#endif
-            if (n <= 0) continue;
-            const char* cur = chunk_buf;
-            const char* limit = chunk_buf + n;
-            if (c > 0) {
-                while (cur < limit && *cur != '\n') cur++;
-                if (cur < limit) cur++;
-            }
-            const char* end = cur;
-            if (c + 1 < nchunks) {
-                const char* target_end = chunk_buf + std::min((size_t)n, kChunk);
-                while (target_end < limit && *target_end != '\n') target_end++;
-                if (target_end < limit) target_end++;
-                end = target_end;
-            } else {
-                end = limit;
-            }
-            if (cur < end) w.scan(cur, end);
+            size_t s = chunk_offsets[c], e = chunk_offsets[c + 1];
+            if (s < e) w.scan(data + s, data + e);
         }
         bar.arrive_and_wait();
         Scratch sc;
@@ -554,18 +531,18 @@ int main(int argc, char** argv) {
     for (auto& th : pool) th.join();
 
     for (unsigned h = 0; h < kHours; ++h) {
-        if (g_out[h].buf && g_out[h].len) {
+        if (g_out[h].buf) {
             write_all(g_out_fd, g_out[h].buf, g_out[h].len);
-            free(g_out[h].buf);
         }
     }
 
 #ifdef _WIN32
     if (g_out_fd >= 0) _close(g_out_fd);
+    UnmapViewOfFile(data);
+    CloseHandle(hMap);
     CloseHandle(hFile);
 #else
     if (g_out_fd >= 0) close(g_out_fd);
-    close(fd);
     _exit(0);
 #endif
     return 0;
