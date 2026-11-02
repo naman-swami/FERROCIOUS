@@ -45,7 +45,7 @@ constexpr unsigned kHours = 72;
 constexpr size_t kChunk = 1024 * 1024;
 constexpr uint32_t kBlock = 1024;   // records per bucket block (4 KB)
 constexpr size_t kWin = 16384;      // bytes indexed for newlines per window (stays in L1)
-constexpr unsigned kMaxThreads = 12;
+constexpr unsigned kMaxThreads = 24;
 
 inline uint64_t rd8(const char* p) { uint64_t w; memcpy(&w, p, 8); return w; }
 inline uint64_t rd4(const char* p) { uint32_t w; memcpy(&w, p, 4); return w; }

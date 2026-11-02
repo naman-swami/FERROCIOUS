@@ -1,3 +1,6 @@
+#if defined(__GLIBC__) || defined(__linux__)
+#include <malloc.h>
+#endif
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -138,7 +141,9 @@ inline size_t intersect_small_large(const uint32_t* sm, size_t ns, const uint32_
     return k;
 }
 
-inline bool match_phrase_kmp_fast(const char* p, const char* end, const std::string_view* terms, const size_t* pi, size_t k) {
+inline bool match_phrase_kmp_fast(const char* p, const char* end, const std::string_view* terms,
+                                  const uint64_t* exp_u64, const uint32_t* exp_len,
+                                  const size_t* pi, size_t k) {
     if (!k) return true;
     size_t j = 0;
     while (p < end) {
@@ -146,15 +151,15 @@ inline bool match_phrase_kmp_fast(const char* p, const char* end, const std::str
         if (p >= end) break;
         const char* start = p;
         while (p < end && TOKEN_CHAR[(uint8_t)*p]) ++p;
-        size_t len = p - start;
+        uint32_t len = (uint32_t)(p - start);
         auto eq = [&](size_t idx) {
-            const auto& exp = terms[idx];
-            if (len != exp.size()) return false;
+            if (len != exp_len[idx]) return false;
             if (len <= 8) {
-                uint64_t w = 0, e = 0;
-                std::memcpy(&w, start, len); std::memcpy(&e, exp.data(), len);
-                return (w | 0x2020202020202020ull) == (e | 0x2020202020202020ull);
+                uint64_t w = 0;
+                std::memcpy(&w, start, len);
+                return (w | 0x2020202020202020ull) == exp_u64[idx];
             }
+            const auto& exp = terms[idx];
             for (size_t x = 0; x < len; ++x) if ((start[x] | 0x20) != (exp[x] | 0x20)) return false;
             return true;
         };
@@ -186,7 +191,7 @@ int main(int argc, char* argv[]) {
 
     unsigned num_threads = std::thread::hardware_concurrency();
     if (!num_threads) num_threads = 6;
-    if (num_threads > 12) num_threads = 12;
+    // no 12-thread clamp
 
     std::vector<std::string_view> query_lines;
     query_lines.reserve(65536);
@@ -407,6 +412,9 @@ int main(int argc, char* argv[]) {
     thread_tokens.clear(); thread_tokens.shrink_to_fit();
     thread_docs.clear(); thread_docs.shrink_to_fit();
     thread_write_ptrs.clear(); thread_write_ptrs.shrink_to_fit();
+#if defined(__GLIBC__) || defined(__linux__)
+    malloc_trim(0);
+#endif
 
     for (size_t i = 0; i < num_bitset_terms; ++i) {
         uint64_t* bits = bitset_arena.data() + i * BITSET_WORDS;
@@ -632,6 +640,16 @@ int main(int argc, char* argv[]) {
                         if (phrase_terms[i] == phrase_terms[j]) ++j;
                         pi[i] = j;
                     }
+                    uint64_t exp_u64[8] = {};
+                    uint32_t exp_len[8] = {};
+                    for (size_t i = 0; i < k_lim; ++i) {
+                        exp_len[i] = (uint32_t)phrase_terms[i].size();
+                        if (exp_len[i] <= 8) {
+                            uint64_t e = 0;
+                            std::memcpy(&e, phrase_terms[i].data(), exp_len[i]);
+                            exp_u64[i] = e | 0x2020202020202020ull;
+                        }
+                    }
                     std::sort(pinfo, pinfo + num_phrase_terms, [](const auto& a, const auto& b) { return a.len < b.len; });
 
                     uint32_t* cur_cand = buf_a.get(), *next_cand = buf_b.get();
@@ -679,7 +697,7 @@ int main(int argc, char* argv[]) {
                         if (doc_id < MAX_DOCS) {
                             const auto& span = doc_spans[doc_id];
                             if (span.len >= min_phrase_len) {
-                                if (match_phrase_kmp_fast(docs_data + span.off, docs_data + span.off + span.len, phrase_terms, pi, k_lim)) {
+                                if (match_phrase_kmp_fast(docs_data + span.off, docs_data + span.off + span.len, phrase_terms, exp_u64, exp_len, pi, k_lim)) {
                                     matches.push_back(doc_id); sum_ids += doc_id;
                                 }
                             }
