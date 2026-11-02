@@ -70,7 +70,6 @@ inline int64_t parse_cents_fast(const char*& p, const char* end) {
     return neg ? -total : total;
 }
 
-// 8-byte fast hash
 inline uint64_t hash_bytes_fast(const char* p, size_t len) {
     uint64_t h = len * 0x517cc1b727220a95ULL;
     while (len >= 8) {
@@ -92,7 +91,7 @@ static constexpr size_t POOL_CAP = 262144;
 static constexpr size_t POOL_MASK = POOL_CAP - 1;
 
 struct PoolSlot {
-    std::atomic<uint32_t> state{0}; // 0 = empty, 1 = reserving, 2 = ready
+    std::atomic<uint32_t> state{0};
     uint64_t hash = 0;
     uint64_t prefix = 0;
     uint32_t offset = 0;
@@ -101,21 +100,11 @@ struct PoolSlot {
 };
 
 static PoolSlot pool_table[POOL_CAP];
-static char pool_arena[2 * 1024 * 1024]; // 2 MB fixed arena
+static char pool_arena[2 * 1024 * 1024];
 static std::atomic<uint32_t> pool_arena_size{0};
 static std::atomic<uint32_t> pool_next_id{0};
 
-inline uint32_t get_or_register_name_fast(const char* s, size_t len) {
-    uint64_t h = hash_bytes_fast(s, len);
-    if (h == 0) h = 1;
-
-    uint64_t prefix = 0;
-    if (len >= 8) {
-        std::memcpy(&prefix, s, 8);
-    } else if (len > 0) {
-        std::memcpy(&prefix, s, len);
-    }
-
+inline uint32_t get_or_register_name_fast(const char* s, size_t len, uint64_t h, uint64_t prefix) {
     size_t idx = h & POOL_MASK;
     while (true) {
         uint32_t st = pool_table[idx].state.load(std::memory_order_acquire);
@@ -153,6 +142,21 @@ inline uint32_t get_or_register_name_fast(const char* s, size_t len) {
     }
 }
 
+struct NCache {
+    static constexpr unsigned N = 1024, M = N - 1;
+    uint64_t h[N]{}, pre[N]{};
+    uint32_t len[N]{}, id[N]{};
+
+    template <class F>
+    inline uint32_t lookup(uint64_t hv, uint64_t prefix, uint32_t n, F&& global_miss) {
+        unsigned i = (unsigned)(hv >> 24) & M;
+        if (h[i] == hv && pre[i] == prefix && len[i] == n) return id[i];
+        uint32_t r = global_miss();
+        h[i] = hv; pre[i] = prefix; len[i] = n; id[i] = r;
+        return r;
+    }
+};
+
 struct ThreadStats {
     uint64_t count = 0;
     int64_t id_sum = 0;
@@ -187,7 +191,6 @@ struct ThreadSafeCountryMap {
             if (c == code) return table[idx].cid;
             if (c == 0) {
                 std::lock_guard<std::mutex> lock(mtx);
-                // Double check under lock
                 c = table[idx].code.load(std::memory_order_relaxed);
                 if (c == code) return table[idx].cid;
                 if (c == 0) {
@@ -218,13 +221,12 @@ int main(int argc, char* argv[]) {
     std::string records_path = data_dir + "/records.csv";
     std::string aggregates_path = out_dir + "/aggregates.txt";
 
-    get_or_register_name_fast("", 0);
+    get_or_register_name_fast("", 0, 1, 0);
 
     unsigned int num_threads = std::thread::hardware_concurrency();
     if (num_threads == 0) num_threads = 6;
     if (num_threads > 12) num_threads = 12;
 
-    // 1. Parallel Ingest of regions.csv across 12 threads
     std::memset(region_to_country, 0xFF, sizeof(region_to_country));
     std::vector<std::string> country_names;
     country_names.reserve(300);
@@ -296,11 +298,9 @@ int main(int argc, char* argv[]) {
 
     uint16_t num_countries = (uint16_t)country_names.size();
 
-    // Allocate single shared global atomic bitset
     size_t total_words = (size_t)num_countries * BITSET_WORDS;
     auto global_seen = std::make_unique<std::atomic<uint64_t>[]>(total_words);
 
-    // 2. Open records.csv
     ferocious::MappedFile mf(records_path.c_str());
     if (!mf.ok) return 1;
 
@@ -325,6 +325,7 @@ int main(int argc, char* argv[]) {
         workers.emplace_back([&, tid]() {
             auto& stats = thread_stats[tid];
             char unescape_buf[512];
+            NCache ncache;
 
             while (true) {
                 uint32_t c = next_chunk.fetch_add(1, std::memory_order_relaxed);
@@ -370,12 +371,10 @@ int main(int argc, char* argv[]) {
                         p++;
                         const char* q = static_cast<const char*>(std::memchr(p, '"', limit - p));
                         if (q && (q + 1 < limit && *(q + 1) == ',')) {
-                            // Fast path: no internal quotes!
                             name_ptr = p;
                             name_len = (uint32_t)(q - p);
-                            p = q + 2; // skip quote and comma
+                            p = q + 2;
                         } else {
-                            // Slower path: unescape internal quotes
                             char* dest = unescape_buf;
                             while (p < limit) {
                                 if (*p == '"') {
@@ -411,11 +410,9 @@ int main(int argc, char* argv[]) {
                         p++;
                         const char* q = static_cast<const char*>(std::memchr(p, '"', limit - p));
                         if (q && (q + 1 < limit && *(q + 1) == ',')) {
-                            // Fast path: no internal quotes!
                             note_len = (uint64_t)(q - p);
-                            p = q + 2; // skip quote and comma
+                            p = q + 2;
                         } else {
-                            // Slower path: count escaped note chars
                             while (p < limit) {
                                 if (*p == '"') {
                                     if (p + 1 < limit && *(p + 1) == '"') {
@@ -467,7 +464,16 @@ int main(int argc, char* argv[]) {
                     cs.name_bytes += name_len;
                     cs.note_bytes += note_len;
 
-                    uint32_t nid = get_or_register_name_fast(name_ptr, name_len);
+                    uint64_t nh = hash_bytes_fast(name_ptr, name_len);
+                    if (nh == 0) nh = 1;
+                    uint64_t npre = 0;
+                    if (name_len >= 8) std::memcpy(&npre, name_ptr, 8);
+                    else if (name_len > 0) std::memcpy(&npre, name_ptr, name_len);
+
+                    uint32_t nid = ncache.lookup(nh, npre, name_len, [&]() {
+                        return get_or_register_name_fast(name_ptr, name_len, nh, npre);
+                    });
+
                     size_t w_idx = (size_t)cid * BITSET_WORDS + (nid >> 6);
                     uint64_t bit = 1ULL << (nid & 63);
                     uint64_t old_val = global_seen[w_idx].load(std::memory_order_relaxed);
@@ -481,7 +487,6 @@ int main(int argc, char* argv[]) {
 
     for (auto& w : workers) w.join();
 
-    // 3. Merge stats and popcount global bitsets
     std::vector<CountryStats> final_stats(num_countries);
     for (uint16_t cid = 0; cid < num_countries; ++cid) {
         auto& fs = final_stats[cid];
@@ -505,7 +510,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 4. Output
     #ifdef _WIN32
     CreateDirectoryA(out_dir.c_str(), NULL);
     #endif
@@ -522,31 +526,30 @@ int main(int argc, char* argv[]) {
     if (!fp) return 1;
 
     ferocious::OutBuf out(fp);
-
     for (uint16_t cid : active_cids) {
+        const auto& fs = final_stats[cid];
         const std::string& cname = country_names[cid];
-        const auto& cs = final_stats[cid];
         out.puts(cname.data(), cname.size());
         out.put(' ');
-        out.u64(cs.count);
+        out.u64(fs.count);
         out.put(' ');
-        out.u64(cs.id_sum);
+        out.u64(fs.id_sum);
         out.put(' ');
-        format_cents(cs.amount_sum, out);
+        format_cents(fs.amount_sum, out);
         out.put(' ');
-        format_cents(cs.amount_min, out);
+        format_cents(fs.amount_min, out);
         out.put(' ');
-        format_cents(cs.amount_max, out);
+        format_cents(fs.amount_max, out);
         out.put(' ');
-        out.u64(cs.names_distinct);
+        out.u64(fs.names_distinct);
         out.put(' ');
-        out.u64(cs.name_bytes);
+        out.u64(fs.name_bytes);
         out.put(' ');
-        out.u64(cs.note_bytes);
+        out.u64(fs.note_bytes);
         out.put('\n');
     }
-
     out.flush();
     fclose(fp);
+
     return 0;
 }

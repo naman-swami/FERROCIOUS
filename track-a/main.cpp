@@ -23,42 +23,34 @@
 
 namespace {
 
-static const std::string HOURS[72] = {
-    "2026-10-30T18:00:00Z", "2026-10-30T19:00:00Z", "2026-10-30T20:00:00Z",
-    "2026-10-30T21:00:00Z", "2026-10-30T22:00:00Z", "2026-10-30T23:00:00Z",
-    "2026-10-31T00:00:00Z", "2026-10-31T01:00:00Z", "2026-10-31T02:00:00Z",
-    "2026-10-31T03:00:00Z", "2026-10-31T04:00:00Z", "2026-10-31T05:00:00Z",
-    "2026-10-31T06:00:00Z", "2026-10-31T07:00:00Z", "2026-10-31T08:00:00Z",
-    "2026-10-31T09:00:00Z", "2026-10-31T10:00:00Z", "2026-10-31T11:00:00Z",
-    "2026-10-31T12:00:00Z", "2026-10-31T13:00:00Z", "2026-10-31T14:00:00Z",
-    "2026-10-31T15:00:00Z", "2026-10-31T16:00:00Z", "2026-10-31T17:00:00Z",
-    "2026-10-31T18:00:00Z", "2026-10-31T19:00:00Z", "2026-10-31T20:00:00Z",
-    "2026-10-31T21:00:00Z", "2026-10-31T22:00:00Z", "2026-10-31T23:00:00Z",
-    "2026-11-01T00:00:00Z", "2026-11-01T01:00:00Z", "2026-11-01T02:00:00Z",
-    "2026-11-01T03:00:00Z", "2026-11-01T04:00:00Z", "2026-11-01T05:00:00Z",
-    "2026-11-01T06:00:00Z", "2026-11-01T07:00:00Z", "2026-11-01T08:00:00Z",
-    "2026-11-01T09:00:00Z", "2026-11-01T10:00:00Z", "2026-11-01T11:00:00Z",
-    "2026-11-01T12:00:00Z", "2026-11-01T13:00:00Z", "2026-11-01T14:00:00Z",
-    "2026-11-01T15:00:00Z", "2026-11-01T16:00:00Z", "2026-11-01T17:00:00Z",
-    "2026-11-01T18:00:00Z", "2026-11-01T19:00:00Z", "2026-11-01T20:00:00Z",
-    "2026-11-01T21:00:00Z", "2026-11-01T22:00:00Z", "2026-11-01T23:00:00Z",
-    "2026-11-02T00:00:00Z", "2026-11-02T01:00:00Z", "2026-11-02T02:00:00Z",
-    "2026-11-02T03:00:00Z", "2026-11-02T04:00:00Z", "2026-11-02T05:00:00Z",
-    "2026-11-02T06:00:00Z", "2026-11-02T07:00:00Z", "2026-11-02T08:00:00Z",
-    "2026-11-02T09:00:00Z", "2026-11-02T10:00:00Z", "2026-11-02T11:00:00Z",
-    "2026-11-02T12:00:00Z", "2026-11-02T13:00:00Z", "2026-11-02T14:00:00Z",
-    "2026-11-02T15:00:00Z", "2026-11-02T16:00:00Z", "2026-11-02T17:00:00Z"
-};
-
 constexpr size_t NUM_HOURS = 72;
 constexpr size_t MAX_ENDPOINTS = 2048;
-constexpr size_t NUM_CELLS = NUM_HOURS * MAX_ENDPOINTS; // 147,456
+constexpr size_t NUM_CELLS = NUM_HOURS * MAX_ENDPOINTS;
 constexpr size_t DICT_CAPACITY = 4096;
 constexpr size_t DICT_MASK = DICT_CAPACITY - 1;
 constexpr uint16_t DICT_CLAIMED = 0xFFFF;
 
+inline void fmt_hour(char* out, uint32_t h) {
+    uint32_t tot_h = 18 + h;
+    uint32_t d_idx = tot_h / 24;
+    uint32_t hr = tot_h % 24;
+    uint32_t month = (d_idx < 2) ? 10 : 11;
+    uint32_t day   = (d_idx < 2) ? (30 + d_idx) : (d_idx - 1);
+
+    out[0] = '2'; out[1] = '0'; out[2] = '2'; out[3] = '6'; out[4] = '-';
+    out[5] = (char)('0' + month / 10);
+    out[6] = (char)('0' + month % 10);
+    out[7] = '-';
+    out[8] = (char)('0' + day / 10);
+    out[9] = (char)('0' + day % 10);
+    out[10] = 'T';
+    out[11] = (char)('0' + hr / 10);
+    out[12] = (char)('0' + hr % 10);
+    out[13] = ':'; out[14] = '0'; out[15] = '0'; out[16] = ':'; out[17] = '0'; out[18] = '0'; out[19] = 'Z';
+}
+
 inline uint32_t parse_hour_idx(const char* p) {
-    uint8_t m_char = p[6]; // '0' for Oct (10), '1' for Nov (11)
+    uint8_t m_char = p[6];
     uint32_t day = (p[8] - '0') * 10 + (p[9] - '0');
     uint32_t hr  = (p[11] - '0') * 10 + (p[12] - '0');
     uint32_t day_offset = (m_char == '0') ? (day - 30) : (day + 1);
@@ -67,16 +59,16 @@ inline uint32_t parse_hour_idx(const char* p) {
 
 inline uint8_t get_method_len(const char* p) {
     char c = p[0];
-    if (c == 'G') return 4; // GET 
+    if (c == 'G') return 4;
     if (c == 'P') {
         char c1 = p[1];
-        if (c1 == 'U') return 4; // PUT 
-        if (c1 == 'O') return 5; // POST 
-        return 6; // PATCH 
+        if (c1 == 'U') return 4;
+        if (c1 == 'O') return 5;
+        return 6;
     }
-    if (c == 'H') return 5; // HEAD 
-    if (c == 'D') return 7; // DELETE 
-    return 8; // OPTIONS 
+    if (c == 'H') return 5;
+    if (c == 'D') return 7;
+    return 8;
 }
 
 inline uint32_t hash_endpoint(const char* p, uint16_t len, uint64_t prefix) {
@@ -92,7 +84,7 @@ inline uint32_t hash_endpoint(const char* p, uint16_t len, uint64_t prefix) {
 }
 
 struct alignas(32) DictSlot {
-    uint64_t prefix = 0; // First 8 chars
+    uint64_t prefix = 0;
     uint32_t hash = 0;
     uint32_t offset = 0;
     uint16_t len = 0;
@@ -188,33 +180,12 @@ inline void insertion_sort(uint32_t* a, size_t n) {
     }
 }
 
-inline char* write_u32(char* p, uint32_t val) {
-    char buf[16];
-    char* cur = buf + 16;
-    if (val == 0) {
-        *p++ = '0';
-        return p;
-    }
-    while (val > 0) {
-        *--cur = '0' + (val % 10);
-        val /= 10;
-    }
-    size_t len = (buf + 16) - cur;
-    std::memcpy(p, cur, len);
-    return p + len;
-}
-
-inline char* write_u64(char* p, uint64_t val) {
+template <typename T>
+inline char* write_uint(char* p, T val) {
     char buf[32];
     char* cur = buf + 32;
-    if (val == 0) {
-        *p++ = '0';
-        return p;
-    }
-    while (val > 0) {
-        *--cur = '0' + (val % 10);
-        val /= 10;
-    }
+    if (val == 0) { *p++ = '0'; return p; }
+    while (val > 0) { *--cur = '0' + (val % 10); val /= 10; }
     size_t len = (buf + 32) - cur;
     std::memcpy(p, cur, len);
     return p + len;
@@ -274,7 +245,6 @@ int main(int argc, char* argv[]) {
     std::vector<std::vector<uint32_t>> thread_counts(num_threads, std::vector<uint32_t>(NUM_CELLS, 0));
     std::vector<std::vector<uint32_t>> thread_errors(num_threads, std::vector<uint32_t>(NUM_CELLS, 0));
 
-    // PASS 1: Skip 38 bytes, backward space scan + Lock-Free Dictionary
     std::vector<std::thread> workers;
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
@@ -326,19 +296,12 @@ int main(int argc, char* argv[]) {
                     counts[cell]++;
                     if (is_err) errors[cell]++;
                 }
-
-                #ifndef _WIN32
-                size_t page_start = start & ~4095ULL;
-                size_t page_len = ((end + 4095ULL) & ~4095ULL) - page_start;
-                madvise((void*)(data + page_start), page_len, MADV_DONTNEED);
-                #endif
             }
         });
     }
     for (auto& w : workers) w.join();
     workers.clear();
 
-    // BARRIER: Lexicographical sort of endpoints
     uint16_t K = g_num_endpoints.load();
     std::vector<uint16_t> sorted_order(K);
     for (uint16_t i = 0; i < K; ++i) sorted_order[i] = i;
@@ -351,7 +314,6 @@ int main(int argc, char* argv[]) {
         g_old_to_lex[sorted_order[rank]] = rank;
     }
 
-    // Remap g_dict slots
     for (size_t i = 0; i < DICT_CAPACITY; ++i) {
         if (g_dict[i].id.load() > 0 && g_dict[i].id.load() <= K) {
             uint16_t old_id = g_dict[i].id.load() - 1;
@@ -359,10 +321,12 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Parallel merge into lex order across threads by hour chunks
     size_t active_cells = NUM_HOURS * K;
     std::vector<uint32_t> g_counts(active_cells, 0);
     std::vector<uint32_t> g_errors(active_cells, 0);
+
+    // Thread-local write offsets: ZERO-ATOMIC scatter
+    std::vector<std::vector<uint32_t>> thread_write_ptrs(num_threads, std::vector<uint32_t>(active_cells, 0));
 
     uint32_t hours_per_tid = (NUM_HOURS + num_threads - 1) / num_threads;
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
@@ -372,18 +336,20 @@ int main(int argc, char* argv[]) {
             for (uint32_t h = h_start; h < h_end; ++h) {
                 size_t dst_base = (size_t)h * K;
                 size_t src_base = (size_t)h * MAX_ENDPOINTS;
-                for (unsigned int t = 0; t < num_threads; ++t) {
-                    const auto& c_vec = thread_counts[t];
-                    const auto& e_vec = thread_errors[t];
-                    for (uint16_t old_id = 0; old_id < K; ++old_id) {
-                        uint32_t cnt = c_vec[src_base + old_id];
+                for (uint16_t old_id = 0; old_id < K; ++old_id) {
+                    uint16_t rank = g_old_to_lex[old_id];
+                    size_t c = dst_base + rank;
+                    uint32_t total_c = 0;
+                    uint32_t total_err = 0;
+                    for (unsigned int t = 0; t < num_threads; ++t) {
+                        uint32_t cnt = thread_counts[t][src_base + old_id];
                         if (cnt > 0) {
-                            uint16_t rank = g_old_to_lex[old_id];
-                            size_t c = dst_base + rank;
-                            g_counts[c] += cnt;
-                            g_errors[c] += e_vec[src_base + old_id];
+                            total_c += cnt;
+                            total_err += thread_errors[t][src_base + old_id];
                         }
                     }
+                    g_counts[c] = total_c;
+                    g_errors[c] = total_err;
                 }
             }
         });
@@ -391,29 +357,34 @@ int main(int argc, char* argv[]) {
     for (auto& w : workers) w.join();
     workers.clear();
 
+    std::vector<uint32_t> g_offsets(active_cells + 1, 0);
+    uint32_t total_records = 0;
+    for (size_t c = 0; c < active_cells; ++c) {
+        g_offsets[c] = total_records;
+        uint32_t running = total_records;
+        size_t h = c / K;
+        size_t rank = c % K;
+        uint16_t old_id = sorted_order[rank];
+        size_t src_idx = h * MAX_ENDPOINTS + old_id;
+        for (unsigned int t = 0; t < num_threads; ++t) {
+            thread_write_ptrs[t][c] = running;
+            running += thread_counts[t][src_idx];
+        }
+        total_records += g_counts[c];
+    }
+    g_offsets[active_cells] = total_records;
+
     thread_counts.clear();
     thread_counts.shrink_to_fit();
     thread_errors.clear();
     thread_errors.shrink_to_fit();
 
-    // Prefix sums
-    std::vector<uint32_t> g_offsets(active_cells + 1, 0);
-    std::vector<std::atomic<uint32_t>> g_cursors(active_cells);
-
-    uint32_t total_records = 0;
-    for (size_t c = 0; c < active_cells; ++c) {
-        g_offsets[c] = total_records;
-        g_cursors[c].store(total_records, std::memory_order_relaxed);
-        total_records += g_counts[c];
-    }
-    g_offsets[active_cells] = total_records;
-
-    // Allocate 12.4 MB flat latencies
     std::vector<uint32_t> g_flat(total_records);
 
-    // PASS 2: Skip 38 bytes + forward latency parse + scatter to flat array
+    // PASS 2: ZERO-ATOMIC Scatter directly into precomputed thread offsets
     for (unsigned int tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
+            auto& write_ptrs = thread_write_ptrs[tid];
             const auto& my_chunks = thread_chunks[tid];
             for (const auto& chk : my_chunks) {
                 const char* cur = data + chk.start;
@@ -443,22 +414,19 @@ int main(int argc, char* argv[]) {
                     }
 
                     size_t cell = (size_t)hour_idx * K + rank;
-                    uint32_t slot = g_cursors[cell].fetch_add(1, std::memory_order_relaxed);
+                    uint32_t slot = write_ptrs[cell]++;
                     g_flat[slot] = lat;
                 }
-
-                #ifndef _WIN32
-                size_t page_start = chk.start & ~4095ULL;
-                size_t page_len = ((chk.end + 4095ULL) & ~4095ULL) - page_start;
-                madvise((void*)(data + page_start), page_len, MADV_DONTNEED);
-                #endif
             }
         });
     }
     for (auto& w : workers) w.join();
     workers.clear();
 
-    // PASS 3: Sort & Direct buffer format
+    thread_write_ptrs.clear();
+    thread_write_ptrs.shrink_to_fit();
+
+    // PASS 3: O(N) std::nth_element & Direct buffer format
     struct ThreadOutBuf {
         std::vector<char> buf;
         size_t len = 0;
@@ -476,7 +444,8 @@ int main(int argc, char* argv[]) {
             char* ptr = out.buf.data();
 
             for (uint32_t h = h_start; h < h_end; ++h) {
-                const std::string& hour_str = HOURS[h];
+                char hour_str[21];
+                fmt_hour(hour_str, h);
                 size_t base = (size_t)h * K;
 
                 for (uint16_t rank = 0; rank < K; ++rank) {
@@ -487,21 +456,30 @@ int main(int argc, char* argv[]) {
                     uint32_t off = g_offsets[c];
                     uint32_t* slice = g_flat.data() + off;
 
+                    uint32_t r50 = (50u * count + 99u) / 100u - 1;
+                    uint32_t r95 = (95u * count + 99u) / 100u - 1;
+                    uint32_t r99 = (99u * count + 99u) / 100u - 1;
+
+                    uint32_t p50, p95, p99;
                     if (count <= 32) {
                         insertion_sort(slice, count);
+                        p50 = slice[r50];
+                        p95 = slice[r95];
+                        p99 = slice[r99];
                     } else {
-                        std::sort(slice, slice + count);
+                        std::nth_element(slice, slice + r50, slice + count);
+                        p50 = slice[r50];
+                        std::nth_element(slice + r50 + 1, slice + r95, slice + count);
+                        p95 = slice[r95];
+                        std::nth_element(slice + r95 + 1, slice + r99, slice + count);
+                        p99 = slice[r99];
                     }
 
-                    uint32_t p50 = slice[(50u * count + 99u) / 100u - 1];
-                    uint32_t p95 = slice[(95u * count + 99u) / 100u - 1];
-                    uint32_t p99 = slice[(99u * count + 99u) / 100u - 1];
                     uint32_t errs = g_errors[c];
                     uint64_t ppm = (static_cast<uint64_t>(errs) * 1000000ULL) / count;
-
                     std::string_view ep_sv = g_endpoint_list[sorted_order[rank]];
 
-                    std::memcpy(ptr, hour_str.data(), 20);
+                    std::memcpy(ptr, hour_str, 20);
                     ptr += 20;
                     *ptr++ = ' ';
 
@@ -509,17 +487,17 @@ int main(int argc, char* argv[]) {
                     ptr += ep_sv.size();
                     *ptr++ = ' ';
 
-                    ptr = write_u64(ptr, count);
+                    ptr = write_uint(ptr, count);
                     *ptr++ = ' ';
-                    ptr = write_u32(ptr, p50);
+                    ptr = write_uint(ptr, p50);
                     *ptr++ = ' ';
-                    ptr = write_u32(ptr, p95);
+                    ptr = write_uint(ptr, p95);
                     *ptr++ = ' ';
-                    ptr = write_u32(ptr, p99);
+                    ptr = write_uint(ptr, p99);
                     *ptr++ = ' ';
-                    ptr = write_u64(ptr, errs);
+                    ptr = write_uint(ptr, errs);
                     *ptr++ = ' ';
-                    ptr = write_u64(ptr, ppm);
+                    ptr = write_uint(ptr, ppm);
                     *ptr++ = '\n';
                 }
             }

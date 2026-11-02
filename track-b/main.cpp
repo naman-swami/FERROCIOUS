@@ -45,67 +45,46 @@ static VocabSlot vocab_table[VOCAB_CAP];
 static uint32_t num_active_tokens = 0;
 
 static constexpr uint32_t BITSET_WORDS = 3908;
-static constexpr uint64_t TAIL_MASK = (1ULL << 16) - 1; // 250,000 % 64 = 16 bits
-static constexpr uint32_t BITSET_FREQ_THRESHOLD = 4000;
+static constexpr uint64_t TAIL_MASK = (1ULL << 16) - 1;
+static constexpr uint32_t BITSET_FREQ_THRESHOLD = 3500;
 
-inline void append_u32(std::string& s, uint32_t val) {
-    char buf[16];
-    char* p = buf + 16;
-    if (val == 0) {
-        s.push_back('0');
-        return;
-    }
-    while (val > 0) {
-        *--p = '0' + (val % 10);
-        val /= 10;
-    }
-    s.append(p, (buf + 16) - p);
-}
-
-inline void append_u64(std::string& s, uint64_t val) {
+template <typename T>
+inline void append_uint(std::string& s, T val) {
     char buf[32];
     char* p = buf + 32;
-    if (val == 0) {
-        s.push_back('0');
-        return;
-    }
-    while (val > 0) {
-        *--p = '0' + (val % 10);
-        val /= 10;
-    }
+    if (val == 0) { s.push_back('0'); return; }
+    while (val > 0) { *--p = '0' + (val % 10); val /= 10; }
     s.append(p, (buf + 32) - p);
 }
 
-inline size_t intersect_sorted_raw(const uint32_t* a, size_t na,
-                                  const uint32_t* b, size_t nb,
-                                  uint32_t* out) {
+template <bool EQ, bool AO, bool BO>
+inline size_t setop(const uint32_t* a, size_t na, const uint32_t* b, size_t nb, uint32_t* out) {
     size_t ia = 0, ib = 0, k = 0;
     while (ia < na && ib < nb) {
-        uint32_t va = a[ia];
-        uint32_t vb = b[ib];
+        uint32_t va = a[ia], vb = b[ib];
         if (va == vb) {
-            out[k++] = va;
-            ia++;
-            ib++;
+            if constexpr (EQ) out[k++] = va;
+            ia++; ib++;
         } else if (va < vb) {
+            if constexpr (AO) out[k++] = va;
             ia++;
         } else {
+            if constexpr (BO) out[k++] = vb;
             ib++;
         }
     }
+    if constexpr (AO) while (ia < na) out[k++] = a[ia++];
+    if constexpr (BO) while (ib < nb) out[k++] = b[ib++];
     return k;
 }
 
-// Galloping / Exponential search for small candidate set vs large posting list
 inline size_t intersect_small_large(const uint32_t* small, size_t ns,
                                     const uint32_t* large, size_t nl,
                                     uint32_t* out) {
-    size_t j = 0;
-    size_t k = 0;
+    size_t j = 0, k = 0;
     for (size_t i = 0; i < ns && j < nl; ++i) {
         uint32_t target = small[i];
-        size_t step = 1;
-        size_t right = j;
+        size_t step = 1, right = j;
         while (right < nl && large[right] < target) {
             j = right;
             right += step;
@@ -122,68 +101,9 @@ inline size_t intersect_small_large(const uint32_t* small, size_t ns,
     return k;
 }
 
-inline size_t union_sorted_raw(const uint32_t* a, size_t na,
-                              const uint32_t* b, size_t nb,
-                              uint32_t* out) {
-    size_t ia = 0, ib = 0, k = 0;
-    while (ia < na && ib < nb) {
-        uint32_t va = a[ia];
-        uint32_t vb = b[ib];
-        if (va == vb) {
-            out[k++] = va;
-            ia++;
-            ib++;
-        } else if (va < vb) {
-            out[k++] = va;
-            ia++;
-        } else {
-            out[k++] = vb;
-            ib++;
-        }
-    }
-    while (ia < na) out[k++] = a[ia++];
-    while (ib < nb) out[k++] = b[ib++];
-    return k;
-}
-
-inline size_t difference_sorted_raw(const uint32_t* a, size_t na,
-                                    const uint32_t* b, size_t nb,
-                                    uint32_t* out) {
-    size_t ia = 0, ib = 0, k = 0;
-    while (ia < na && ib < nb) {
-        uint32_t va = a[ia];
-        uint32_t vb = b[ib];
-        if (va == vb) {
-            ia++;
-            ib++;
-        } else if (va < vb) {
-            out[k++] = va;
-            ia++;
-        } else {
-            ib++;
-        }
-    }
-    while (ia < na) out[k++] = a[ia++];
-    return k;
-}
-
-// Stage 1: Correct KMP Phrase Matcher with pi[8] prefix table
-inline bool match_phrase_kmp(const char* p, const char* end,
-                             const std::string_view* terms, size_t k) {
+inline bool match_phrase_kmp_fast(const char* p, const char* end,
+                                  const std::string_view* terms, const size_t* pi, size_t k) {
     if (k == 0) return true;
-    if (k > 8) k = 8;
-
-    size_t pi[8] = {};
-    for (size_t i = 1, j = 0; i < k; ++i) {
-        while (j > 0 && terms[i] != terms[j]) {
-            j = pi[j - 1];
-        }
-        if (terms[i] == terms[j]) {
-            ++j;
-        }
-        pi[i] = j;
-    }
-
     size_t j = 0;
     while (p < end) {
         while (p < end && TOKEN_CHAR[(uint8_t)*p] == 0) ++p;
@@ -196,23 +116,21 @@ inline bool match_phrase_kmp(const char* p, const char* end,
         auto equals_term = [&](size_t idx) {
             const auto& expected = terms[idx];
             if (len != expected.size()) return false;
+            if (len <= 8) {
+                uint64_t w = 0, exp = 0;
+                std::memcpy(&w, start, len);
+                std::memcpy(&exp, expected.data(), len);
+                return (w | 0x2020202020202020ull) == (exp | 0x2020202020202020ull);
+            }
             for (size_t x = 0; x < len; ++x) {
-                if (TOKEN_CHAR[(uint8_t)start[x]] != (uint8_t)expected[x]) {
-                    return false;
-                }
+                if ((start[x] | 0x20) != (expected[x] | 0x20)) return false;
             }
             return true;
         };
 
-        while (j > 0 && !equals_term(j)) {
-            j = pi[j - 1];
-        }
-        if (equals_term(j)) {
-            ++j;
-        }
-        if (j == k) {
-            return true;
-        }
+        while (j > 0 && !equals_term(j)) j = pi[j - 1];
+        if (equals_term(j)) ++j;
+        if (j == k) return true;
     }
     return false;
 }
@@ -244,7 +162,6 @@ int main(int argc, char* argv[]) {
     if (num_threads == 0) num_threads = 6;
     if (num_threads > 12) num_threads = 12;
 
-    // 1. Scan queries.txt to collect unique vocabulary
     std::vector<std::string_view> query_lines;
     query_lines.reserve(65536);
 
@@ -311,7 +228,6 @@ int main(int argc, char* argv[]) {
         qp = nl ? nl + 1 : qend;
     }
 
-    // 2. Discover document chunks directly via line boundaries (ZERO newline-counting pass!)
     size_t chunk_bytes = docs_size / num_threads;
     std::vector<const char*> chunk_starts(num_threads);
     std::vector<const char*> chunk_ends(num_threads);
@@ -326,13 +242,12 @@ int main(int argc, char* argv[]) {
     }
 
     struct DocSpan {
-        const char* start = nullptr;
-        const char* end = nullptr;
+        uint32_t off = 0;
+        uint32_t len = 0;
     };
     constexpr size_t MAX_DOCS = 262144;
     std::vector<DocSpan> doc_spans(MAX_DOCS);
 
-    // 3. Pass 1: Count posting frequencies using last_doc_seen stamp array (ZERO std::sort!)
     std::vector<std::vector<uint32_t>> thread_counts(num_threads, std::vector<uint32_t>(num_active_tokens, 0));
     std::vector<std::thread> workers;
 
@@ -344,7 +259,6 @@ int main(int argc, char* argv[]) {
             std::vector<uint32_t> last_doc_seen(num_active_tokens, 0xFFFFFFFFu);
 
             while (cur < limit) {
-                // Parse doc_id directly from line start
                 uint32_t cur_doc_id = 0;
                 while (cur < limit && static_cast<unsigned char>(*cur - '0') <= 9) {
                     cur_doc_id = cur_doc_id * 10 + (*cur - '0');
@@ -362,7 +276,7 @@ int main(int argc, char* argv[]) {
                 while (text_end > text_start && (text_end[-1] == '\r' || text_end[-1] == ' ' || text_end[-1] == '\t')) text_end--;
 
                 if (cur_doc_id < MAX_DOCS) {
-                    doc_spans[cur_doc_id] = {text_start, text_end};
+                    doc_spans[cur_doc_id] = {(uint32_t)(text_start - docs_data), (uint32_t)(text_end - text_start)};
                 }
 
                 const char* p = text_start;
@@ -397,7 +311,6 @@ int main(int argc, char* argv[]) {
     for (auto& w : workers) w.join();
     workers.clear();
 
-    // 4. Prefix Sums & Direct CSR allocation
     std::vector<uint32_t> csr_offsets(num_active_tokens + 1, 0);
     std::vector<std::vector<uint32_t>> thread_write_ptrs(num_threads, std::vector<uint32_t>(num_active_tokens, 0));
 
@@ -419,7 +332,6 @@ int main(int argc, char* argv[]) {
 
     std::vector<uint32_t> csr_doc_ids(total_postings);
 
-    // 5. Pass 2: Direct Scatter into csr_doc_ids using last_doc_seen stamp array (ZERO std::sort!)
     for (unsigned tid = 0; tid < num_threads; ++tid) {
         workers.emplace_back([&, tid]() {
             auto& write_ptrs = thread_write_ptrs[tid];
@@ -480,7 +392,6 @@ int main(int argc, char* argv[]) {
     thread_write_ptrs.clear();
     thread_write_ptrs.shrink_to_fit();
 
-    // 6. Precompute Dense Bitsets for Frequent Terms (df >= BITSET_FREQ_THRESHOLD)
     std::vector<const uint64_t*> term_bitsets(num_active_tokens, nullptr);
     std::vector<std::vector<uint64_t>> bitset_arena;
     bitset_arena.reserve(1024);
@@ -503,7 +414,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 7. Parallel Query Processing with KMP and Galloping Candidate Filtering
     std::vector<std::string> thread_outputs(num_threads);
     size_t num_queries = query_lines.size();
     size_t queries_per_thread = (num_queries + num_threads - 1) / num_threads;
@@ -515,7 +425,7 @@ int main(int argc, char* argv[]) {
             if (q_start >= q_end) return;
 
             std::string& out_str = thread_outputs[tid];
-            out_str.reserve(2 * 1024 * 1024); // Slashed from 16 MB to 2 MB (saves 168 MB RSS!)
+            out_str.reserve(1024 * 1024);
 
             std::vector<uint32_t> buf_a(262144);
             std::vector<uint32_t> buf_b(262144);
@@ -530,8 +440,7 @@ int main(int argc, char* argv[]) {
 
                 if (qline.starts_with("BOOL ")) {
                     std::string_view rest = qline.substr(5);
-                    size_t num_parts = 0;
-                    size_t pos = 0;
+                    size_t num_parts = 0, pos = 0;
                     while (pos < rest.size() && num_parts < 32) {
                         size_t next_sp = rest.find(' ', pos);
                         if (next_sp == std::string_view::npos) {
@@ -582,7 +491,6 @@ int main(int argc, char* argv[]) {
                         if (op == "AND") {
                             if (cur_len > 0 && post_len > 0) {
                                 if (post_bitset) {
-                                    // Bitset Probe O(survivors)
                                     for (size_t k = 0; k < cur_len; ++k) {
                                         uint32_t doc = cur_buf[k];
                                         if ((post_bitset[doc >> 6] & (1ULL << (doc & 63))) != 0) {
@@ -592,14 +500,14 @@ int main(int argc, char* argv[]) {
                                 } else if (cur_len * 8 < post_len) {
                                     next_len = intersect_small_large(cur_buf, cur_len, post_data, post_len, next_buf);
                                 } else {
-                                    next_len = intersect_sorted_raw(cur_buf, cur_len, post_data, post_len, next_buf);
+                                    next_len = setop<true, false, false>(cur_buf, cur_len, post_data, post_len, next_buf);
                                 }
                             }
                             cur_len = next_len;
                             std::swap(cur_buf, next_buf);
                         } else if (op == "OR") {
                             if (post_len > 0) {
-                                next_len = union_sorted_raw(cur_buf, cur_len, post_data, post_len, next_buf);
+                                next_len = setop<true, true, true>(cur_buf, cur_len, post_data, post_len, next_buf);
                                 cur_len = next_len;
                                 std::swap(cur_buf, next_buf);
                             }
@@ -615,7 +523,7 @@ int main(int argc, char* argv[]) {
                                     cur_len = next_len;
                                     std::swap(cur_buf, next_buf);
                                 } else {
-                                    next_len = difference_sorted_raw(cur_buf, cur_len, post_data, post_len, next_buf);
+                                    next_len = setop<false, true, false>(cur_buf, cur_len, post_data, post_len, next_buf);
                                     cur_len = next_len;
                                     std::swap(cur_buf, next_buf);
                                 }
@@ -630,14 +538,14 @@ int main(int argc, char* argv[]) {
                         for (size_t k = 0; k < cur_len; ++k) {
                             sum_ids += cur_buf[k];
                         }
-                        append_u64(out_str, cur_len);
+                        append_uint(out_str, cur_len);
                         out_str.push_back(' ');
-                        append_u64(out_str, sum_ids);
+                        append_uint(out_str, sum_ids);
 
                         size_t emit_count = std::min(cur_len, (size_t)10);
                         for (size_t k = 0; k < emit_count; ++k) {
                             out_str.push_back(' ');
-                            append_u32(out_str, cur_buf[k]);
+                            append_uint(out_str, cur_buf[k]);
                         }
                         out_str.push_back('\n');
                     }
@@ -645,14 +553,16 @@ int main(int argc, char* argv[]) {
                     std::string_view inner = qline.substr(8);
                     if (!inner.empty() && inner.back() == '"') inner.remove_suffix(1);
 
-                    size_t num_phrase_terms = 0;
-                    size_t pos = 0;
+                    size_t num_phrase_terms = 0, pos = 0;
+                    size_t min_len = 0;
                     while (pos < inner.size() && num_phrase_terms < 32) {
                         while (pos < inner.size() && inner[pos] == ' ') pos++;
                         if (pos >= inner.size()) break;
                         size_t next_sp = inner.find(' ', pos);
                         if (next_sp == std::string_view::npos) next_sp = inner.size();
-                        phrase_terms[num_phrase_terms++] = inner.substr(pos, next_sp - pos);
+                        std::string_view w = inner.substr(pos, next_sp - pos);
+                        min_len += w.size();
+                        phrase_terms[num_phrase_terms++] = w;
                         pos = next_sp;
                     }
 
@@ -676,8 +586,7 @@ int main(int argc, char* argv[]) {
                             break;
                         }
                         uint32_t start = csr_offsets[tid_val];
-                        uint32_t end = csr_offsets[tid_val + 1];
-                        size_t plen = end - start;
+                        uint32_t plen = csr_offsets[tid_val + 1] - start;
                         if (plen == 0) {
                             missing = true;
                             break;
@@ -690,7 +599,14 @@ int main(int argc, char* argv[]) {
                         continue;
                     }
 
-                    // Sort terms by posting length (rarest term first!)
+                    size_t k_lim = std::min(num_phrase_terms, (size_t)8);
+                    size_t pi[8] = {};
+                    for (size_t i = 1, j = 0; i < k_lim; ++i) {
+                        while (j > 0 && phrase_terms[i] != phrase_terms[j]) j = pi[j - 1];
+                        if (phrase_terms[i] == phrase_terms[j]) ++j;
+                        pi[i] = j;
+                    }
+
                     std::sort(pinfo, pinfo + num_phrase_terms, [](const auto& a, const auto& b) {
                         return a.len < b.len;
                     });
@@ -703,9 +619,8 @@ int main(int argc, char* argv[]) {
                     size_t cur_cand_len = pinfo[0].len;
                     std::memcpy(cur_cand, csr_doc_ids.data() + f_start, cur_cand_len * sizeof(uint32_t));
 
-                    // Intersect with remaining distinct terms using galloping search
                     for (size_t i = 1; i < num_phrase_terms && cur_cand_len > 0; ++i) {
-                        if (pinfo[i].tok_id == pinfo[i - 1].tok_id) continue; // deduplicate repeated candidate terms
+                        if (pinfo[i].tok_id == pinfo[i - 1].tok_id) continue;
 
                         uint32_t t_id = pinfo[i].tok_id;
                         const uint64_t* p_bitset = term_bitsets[t_id];
@@ -724,14 +639,13 @@ int main(int argc, char* argv[]) {
                             if (cur_cand_len * 8 < post_len) {
                                 next_len = intersect_small_large(cur_cand, cur_cand_len, csr_doc_ids.data() + start, post_len, next_cand);
                             } else {
-                                next_len = intersect_sorted_raw(cur_cand, cur_cand_len, csr_doc_ids.data() + start, post_len, next_cand);
+                                next_len = setop<true, false, false>(cur_cand, cur_cand_len, csr_doc_ids.data() + start, post_len, next_cand);
                             }
                         }
                         cur_cand_len = next_len;
                         std::swap(cur_cand, next_cand);
                     }
 
-                    // Verification phase via KMP matcher
                     matches.clear();
                     uint64_t sum_ids = 0;
 
@@ -739,8 +653,10 @@ int main(int argc, char* argv[]) {
                         uint32_t doc_id = cur_cand[k];
                         if (doc_id < MAX_DOCS) {
                             const auto& span = doc_spans[doc_id];
-                            if (span.start && span.end > span.start) {
-                                if (match_phrase_kmp(span.start, span.end, phrase_terms, num_phrase_terms)) {
+                            if (span.len >= min_len) {
+                                const char* s = docs_data + span.off;
+                                const char* e = s + span.len;
+                                if (match_phrase_kmp_fast(s, e, phrase_terms, pi, k_lim)) {
                                     matches.push_back(doc_id);
                                     sum_ids += doc_id;
                                 }
@@ -751,14 +667,14 @@ int main(int argc, char* argv[]) {
                     if (matches.empty()) {
                         out_str.append("0 0\n");
                     } else {
-                        append_u64(out_str, matches.size());
+                        append_uint(out_str, matches.size());
                         out_str.push_back(' ');
-                        append_u64(out_str, sum_ids);
+                        append_uint(out_str, sum_ids);
 
                         size_t emit_count = std::min(matches.size(), (size_t)10);
                         for (size_t k = 0; k < emit_count; ++k) {
                             out_str.push_back(' ');
-                            append_u32(out_str, matches[k]);
+                            append_uint(out_str, matches[k]);
                         }
                         out_str.push_back('\n');
                     }
