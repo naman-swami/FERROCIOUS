@@ -12,13 +12,94 @@
 #include <bit>
 #include <memory>
 #include <chrono>
-#include "ferocious_common.hpp"
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <direct.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 namespace {
+
+struct OutBuf {
+    FILE* f;
+    std::vector<char> b;
+    size_t n = 0;
+    explicit OutBuf(FILE* f) : f(f), b(1 << 20) {}
+    ~OutBuf() { flush(); }
+    void flush() { if (n && f) { fwrite(b.data(), 1, n, f); n = 0; } }
+    inline void put(char c) { b[n++] = c; if (n == b.size()) flush(); }
+    inline void puts(const char* s, size_t len) {
+        for (size_t i = 0; i < len; ++i) put(s[i]);
+    }
+    inline void u64(uint64_t v) {
+        char t[24]; int k = 0;
+        do { t[k++] = char('0' + v % 10); v /= 10; } while (v);
+        while (k) put(t[--k]);
+    }
+};
+
+struct MappedFile {
+    void*    data = nullptr;
+    size_t   size = 0;
+    bool     ok   = false;
+#ifdef _WIN32
+    HANDLE   hFile = INVALID_HANDLE_VALUE;
+    HANDLE   hMap  = NULL;
+#endif
+
+    explicit MappedFile(const char* path) {
+#ifdef _WIN32
+        hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) return;
+        LARGE_INTEGER li;
+        if (!GetFileSizeEx(hFile, &li)) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; return; }
+        size = (size_t)li.QuadPart;
+        if (size == 0) { ok = true; return; }
+        hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+        if (!hMap) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; return; }
+        data = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+        if (!data) { CloseHandle(hMap); hMap = NULL; CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; return; }
+        ok = true;
+#else
+        int fd = ::open(path, O_RDONLY);
+        if (fd < 0) return;
+        struct stat st;
+        if (::fstat(fd, &st) != 0) { ::close(fd); return; }
+        size = (size_t)st.st_size;
+        if (size == 0) { ok = true; ::close(fd); return; }
+        data = ::mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+        ::close(fd);
+        if (data == MAP_FAILED) { data = nullptr; size = 0; return; }
+        ok = true;
+        if (size >= (1u << 21))
+            ::madvise(data, size, MADV_SEQUENTIAL | MADV_WILLNEED);
+#endif
+    }
+
+    ~MappedFile() {
+#ifdef _WIN32
+        if (data) UnmapViewOfFile(data);
+        if (hMap) CloseHandle(hMap);
+        if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+#else
+        if (data) ::munmap(data, size);
+#endif
+    }
+    MappedFile(const MappedFile&)            = delete;
+    MappedFile& operator=(const MappedFile&) = delete;
+};
 
 struct CountryStats {
     uint64_t count = 0;
@@ -31,7 +112,7 @@ struct CountryStats {
     uint64_t note_bytes = 0;
 };
 
-inline void format_cents(int64_t cents, ferocious::OutBuf& out) {
+inline void format_cents(int64_t cents, OutBuf& out) {
     if (cents < 0) {
         out.put('-');
         cents = -cents;
@@ -92,11 +173,10 @@ static constexpr size_t POOL_MASK = POOL_CAP - 1;
 
 struct PoolSlot {
     std::atomic<uint32_t> state{0};
-    uint64_t hash = 0;
-    uint64_t prefix = 0;
     uint32_t offset = 0;
     uint32_t len = 0;
     uint32_t name_id = 0;
+    uint64_t hash = 0;
 };
 
 static PoolSlot pool_table[POOL_CAP];
@@ -104,7 +184,7 @@ static char pool_arena[2 * 1024 * 1024];
 static std::atomic<uint32_t> pool_arena_size{0};
 static std::atomic<uint32_t> pool_next_id{0};
 
-inline uint32_t get_or_register_name_fast(const char* s, size_t len, uint64_t h, uint64_t prefix) {
+inline uint32_t get_or_register_name_fast(const char* s, size_t len, uint64_t h) {
     size_t idx = h & POOL_MASK;
     while (true) {
         uint32_t st = pool_table[idx].state.load(std::memory_order_acquire);
@@ -118,7 +198,6 @@ inline uint32_t get_or_register_name_fast(const char* s, size_t len, uint64_t h,
                 pool_table[idx].len = (uint32_t)len;
                 pool_table[idx].name_id = nid;
                 pool_table[idx].hash = h;
-                pool_table[idx].prefix = prefix;
                 pool_table[idx].state.store(2, std::memory_order_release);
                 return nid;
             }
@@ -132,8 +211,8 @@ inline uint32_t get_or_register_name_fast(const char* s, size_t len, uint64_t h,
             st = pool_table[idx].state.load(std::memory_order_acquire);
         }
 
-        if (st == 2 && pool_table[idx].hash == h && pool_table[idx].prefix == prefix && pool_table[idx].len == len) {
-            if (len <= 8 || std::memcmp(pool_arena + pool_table[idx].offset + 8, s + 8, len - 8) == 0) {
+        if (st == 2 && pool_table[idx].hash == h && pool_table[idx].len == len) {
+            if (std::memcmp(pool_arena + pool_table[idx].offset, s, len) == 0) {
                 return pool_table[idx].name_id;
             }
         }
@@ -144,15 +223,15 @@ inline uint32_t get_or_register_name_fast(const char* s, size_t len, uint64_t h,
 
 struct NCache {
     static constexpr unsigned N = 1024, M = N - 1;
-    uint64_t h[N]{}, pre[N]{};
+    uint64_t h[N]{};
     uint32_t len[N]{}, id[N]{};
 
     template <class F>
-    inline uint32_t lookup(uint64_t hv, uint64_t prefix, uint32_t n, F&& global_miss) {
+    inline uint32_t lookup(uint64_t hv, uint32_t n, F&& global_miss) {
         unsigned i = (unsigned)(hv >> 24) & M;
-        if (h[i] == hv && pre[i] == prefix && len[i] == n) return id[i];
+        if (h[i] == hv && len[i] == n) return id[i];
         uint32_t r = global_miss();
-        h[i] = hv; pre[i] = prefix; len[i] = n; id[i] = r;
+        h[i] = hv; len[i] = n; id[i] = r;
         return r;
     }
 };
@@ -221,72 +300,86 @@ int main(int argc, char* argv[]) {
     std::string records_path = data_dir + "/records.csv";
     std::string aggregates_path = out_dir + "/aggregates.txt";
 
-    get_or_register_name_fast("", 0, 1, 0);
+    std::vector<std::string> country_names;
+    uint16_t unmatched_cid = 0;
+    std::memset(region_to_country, 0xFF, sizeof(region_to_country));
 
     unsigned int num_threads = std::thread::hardware_concurrency();
-    if (num_threads == 0) num_threads = 6;
-    if (num_threads > 12) num_threads = 12;
-
-    std::memset(region_to_country, 0xFF, sizeof(region_to_country));
-    std::vector<std::string> country_names;
-    country_names.reserve(300);
-    ThreadSafeCountryMap cmap;
-    uint16_t unmatched_cid = 0xFFFF;
+    if (num_threads == 0) num_threads = 4;
 
     {
-        ferocious::MappedFile rmf(regions_path.c_str());
+        MappedFile rmf(regions_path.c_str());
         if (!rmf.ok) return 1;
 
-        const char* r_data = static_cast<const char*>(rmf.data);
-        size_t r_size = rmf.size;
+        const char* rdata = static_cast<const char*>(rmf.data);
+        size_t rsize = rmf.size;
 
-        const char* r_hdr = static_cast<const char*>(std::memchr(r_data, '\n', r_size));
-        size_t r_start = r_hdr ? (r_hdr - r_data + 1) : 0;
+        size_t r_start = 0;
+        if (rsize >= 3 && (uint8_t)rdata[0] == 0xEF && (uint8_t)rdata[1] == 0xBB && (uint8_t)rdata[2] == 0xBF) {
+            r_start = 3;
+        }
+        const char* r_nl = static_cast<const char*>(std::memchr(rdata + r_start, '\n', rsize - r_start));
+        if (r_nl) r_start = (r_nl - rdata) + 1;
 
-        size_t r_chunk_bytes = (r_size - r_start) / num_threads;
+        ThreadSafeCountryMap cmap;
+        constexpr size_t R_CHUNK_SIZE = 64 * 1024;
+        size_t num_r_chunks = (rsize - r_start + R_CHUNK_SIZE - 1) / R_CHUNK_SIZE;
+        std::atomic<uint32_t> next_r_chunk{0};
 
         std::vector<std::thread> r_workers;
         for (unsigned int tid = 0; tid < num_threads; ++tid) {
-            r_workers.emplace_back([&, tid]() {
-                size_t start = r_start + tid * r_chunk_bytes;
-                size_t end = (tid == num_threads - 1) ? r_size : r_start + (tid + 1) * r_chunk_bytes;
+            r_workers.emplace_back([&]() {
+                while (true) {
+                    uint32_t c = next_r_chunk.fetch_add(1, std::memory_order_relaxed);
+                    if (c >= num_r_chunks) break;
 
-                if (tid > 0) {
-                    while (start < r_size && r_data[start] != '\n') start++;
-                    if (start < r_size) start++;
-                }
-                if (tid < num_threads - 1) {
-                    while (end < r_size && r_data[end] != '\n') end++;
-                    if (end < r_size) end++;
-                }
+                    size_t start = r_start + (size_t)c * R_CHUNK_SIZE;
+                    size_t end = std::min(r_start + ((size_t)c + 1) * R_CHUNK_SIZE, rsize);
 
-                const char* p = r_data + start;
-                const char* limit = r_data + end;
-
-                while (p < limit) {
-                    if (*p == '\r' || *p == '\n') { p++; continue; }
-                    uint32_t rid = 0;
-                    while (p < limit && static_cast<unsigned char>(*p - '0') <= 9) {
-                        rid = rid * 10 + (*p - '0');
-                        p++;
+                    if (c > 0) {
+                        while (start + 1 < rsize && !(rdata[start] == '\r' && rdata[start + 1] == '\n')) start++;
+                        if (start + 1 < rsize) start += 2;
                     }
-                    if (p < limit && *p == ',') p++;
-                    const char* cstart = p;
-                    while (p < limit && *p != '\r' && *p != '\n') p++;
-                    size_t clen = p - cstart;
-
-                    uint32_t code = 0;
-                    if (clen == 3) {
-                        code = (uint8_t)cstart[0] | ((uint8_t)cstart[1] << 8) | ((uint8_t)cstart[2] << 16);
-                    } else {
-                        for (size_t i = 0; i < clen && i < 4; ++i) code |= ((uint8_t)cstart[i] << (i * 8));
+                    if (c + 1 < num_r_chunks) {
+                        while (end + 1 < rsize && !(rdata[end] == '\r' && rdata[end + 1] == '\n')) end++;
+                        if (end + 1 < rsize) end += 2;
                     }
 
-                    uint16_t cid = cmap.get_or_insert(code, cstart, clen, country_names);
-                    if (rid < 1000000) region_to_country[rid] = cid;
+                    const char* p = rdata + start;
+                    const char* limit = rdata + end;
 
-                    if (p < limit && *p == '\r') p++;
-                    if (p < limit && *p == '\n') p++;
+                    while (p < limit) {
+                        if (p >= limit || *p == '\r' || *p == '\n') {
+                            if (p < limit) p++;
+                            continue;
+                        }
+
+                        uint32_t rid = 0;
+                        while (p < limit && static_cast<unsigned char>(*p - '0') <= 9) {
+                            rid = rid * 10 + (*p - '0');
+                            p++;
+                        }
+                        if (p < limit && *p == ',') p++;
+
+                        const char* cstart = p;
+                        while (p < limit && *p != '\r' && *p != '\n') p++;
+                        size_t clen = p - cstart;
+
+                        uint32_t code = 0;
+                        if (clen == 2) {
+                            code = (uint8_t)cstart[0] | ((uint8_t)cstart[1] << 8);
+                        } else if (clen == 3) {
+                            code = (uint8_t)cstart[0] | ((uint8_t)cstart[1] << 8) | ((uint8_t)cstart[2] << 16);
+                        } else {
+                            for (size_t i = 0; i < clen && i < 4; ++i) code |= ((uint8_t)cstart[i] << (i * 8));
+                        }
+
+                        uint16_t cid = cmap.get_or_insert(code, cstart, clen, country_names);
+                        if (rid < 1000000) region_to_country[rid] = cid;
+
+                        if (p < limit && *p == '\r') p++;
+                        if (p < limit && *p == '\n') p++;
+                    }
                 }
             });
         }
@@ -301,7 +394,7 @@ int main(int argc, char* argv[]) {
     size_t total_words = (size_t)num_countries * BITSET_WORDS;
     auto global_seen = std::make_unique<std::atomic<uint64_t>[]>(total_words);
 
-    ferocious::MappedFile mf(records_path.c_str());
+    MappedFile mf(records_path.c_str());
     if (!mf.ok) return 1;
 
     const char* data = static_cast<const char*>(mf.data);
@@ -466,12 +559,9 @@ int main(int argc, char* argv[]) {
 
                     uint64_t nh = hash_bytes_fast(name_ptr, name_len);
                     if (nh == 0) nh = 1;
-                    uint64_t npre = 0;
-                    if (name_len >= 8) std::memcpy(&npre, name_ptr, 8);
-                    else if (name_len > 0) std::memcpy(&npre, name_ptr, name_len);
 
-                    uint32_t nid = ncache.lookup(nh, npre, name_len, [&]() {
-                        return get_or_register_name_fast(name_ptr, name_len, nh, npre);
+                    uint32_t nid = ncache.lookup(nh, name_len, [&]() {
+                        return get_or_register_name_fast(name_ptr, name_len, nh);
                     });
 
                     size_t w_idx = (size_t)cid * BITSET_WORDS + (nid >> 6);
@@ -510,9 +600,9 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    #ifdef _WIN32
+#ifdef _WIN32
     CreateDirectoryA(out_dir.c_str(), NULL);
-    #endif
+#endif
 
     std::vector<uint16_t> active_cids;
     for (uint16_t cid = 0; cid < num_countries; ++cid) {
@@ -525,7 +615,7 @@ int main(int argc, char* argv[]) {
     FILE* fp = fopen(aggregates_path.c_str(), "wb");
     if (!fp) return 1;
 
-    ferocious::OutBuf out(fp);
+    OutBuf out(fp);
     for (uint16_t cid : active_cids) {
         const auto& fs = final_stats[cid];
         const std::string& cname = country_names[cid];

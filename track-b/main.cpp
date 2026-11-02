@@ -12,9 +12,85 @@
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
-#include "ferocious_common.hpp"
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <direct.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 namespace {
+
+struct OutBuf {
+    FILE* f;
+    std::vector<char> b;
+    size_t n = 0;
+    explicit OutBuf(FILE* f) : f(f), b(1 << 20) {}
+    ~OutBuf() { flush(); }
+    void flush() { if (n && f) { fwrite(b.data(), 1, n, f); n = 0; } }
+    inline void put(char c) { b[n++] = c; if (n == b.size()) flush(); }
+    inline void puts(const char* s, size_t len) {
+        for (size_t i = 0; i < len; ++i) put(s[i]);
+    }
+};
+
+struct MappedFile {
+    void*    data = nullptr;
+    size_t   size = 0;
+    bool     ok   = false;
+#ifdef _WIN32
+    HANDLE   hFile = INVALID_HANDLE_VALUE;
+    HANDLE   hMap  = NULL;
+#endif
+
+    explicit MappedFile(const char* path) {
+#ifdef _WIN32
+        hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) return;
+        LARGE_INTEGER li;
+        if (!GetFileSizeEx(hFile, &li)) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; return; }
+        size = (size_t)li.QuadPart;
+        if (size == 0) { ok = true; return; }
+        hMap = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+        if (!hMap) { CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; return; }
+        data = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+        if (!data) { CloseHandle(hMap); hMap = NULL; CloseHandle(hFile); hFile = INVALID_HANDLE_VALUE; return; }
+        ok = true;
+#else
+        int fd = ::open(path, O_RDONLY);
+        if (fd < 0) return;
+        struct stat st;
+        if (::fstat(fd, &st) != 0) { ::close(fd); return; }
+        size = (size_t)st.st_size;
+        if (size == 0) { ok = true; ::close(fd); return; }
+        data = ::mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+        ::close(fd);
+        if (data == MAP_FAILED) { data = nullptr; size = 0; return; }
+        ok = true;
+        if (size >= (1u << 21))
+            ::madvise(data, size, MADV_SEQUENTIAL | MADV_WILLNEED);
+#endif
+    }
+
+    ~MappedFile() {
+#ifdef _WIN32
+        if (data) UnmapViewOfFile(data);
+        if (hMap) CloseHandle(hMap);
+        if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+#else
+        if (data) ::munmap(data, size);
+#endif
+    }
+    MappedFile(const MappedFile&)            = delete;
+    MappedFile& operator=(const MappedFile&) = delete;
+};
 
 inline constexpr auto TOKEN_CHAR = [] {
     std::array<uint8_t, 256> t{};
@@ -43,6 +119,22 @@ struct VocabSlot {
 
 static VocabSlot vocab_table[VOCAB_CAP];
 static uint32_t num_active_tokens = 0;
+
+static uint64_t bloom_bits[4096];
+
+inline void bloom_set(uint64_t h) {
+    bloom_bits[(h & 0x3FFFF) >> 6] |= (1ULL << (h & 63));
+    uint64_t h2 = h >> 18;
+    bloom_bits[(h2 & 0x3FFFF) >> 6] |= (1ULL << (h2 & 63));
+}
+
+inline bool bloom_test(uint64_t h) {
+    uint64_t mask1 = 1ULL << (h & 63);
+    if ((bloom_bits[(h & 0x3FFFF) >> 6] & mask1) == 0) return false;
+    uint64_t h2 = h >> 18;
+    uint64_t mask2 = 1ULL << (h2 & 63);
+    return (bloom_bits[(h2 & 0x3FFFF) >> 6] & mask2) != 0;
+}
 
 static constexpr uint32_t BITSET_WORDS = 3908;
 static constexpr uint64_t TAIL_MASK = (1ULL << 16) - 1;
@@ -148,12 +240,12 @@ int main(int argc, char* argv[]) {
     std::string queries_path = data_dir + "/queries.txt";
     std::string results_path = out_dir + "/results.txt";
 
-    ferocious::MappedFile dmf(docs_path.c_str());
+    MappedFile dmf(docs_path.c_str());
     if (!dmf.ok) return 1;
     const char* docs_data = static_cast<const char*>(dmf.data);
     size_t docs_size = dmf.size;
 
-    ferocious::MappedFile qmf(queries_path.c_str());
+    MappedFile qmf(queries_path.c_str());
     if (!qmf.ok) return 1;
     const char* queries_data = static_cast<const char*>(qmf.data);
     size_t queries_size = qmf.size;
@@ -167,6 +259,7 @@ int main(int argc, char* argv[]) {
 
     auto insert_token = [&](std::string_view sv) -> uint32_t {
         uint64_t h = fnv1a_str(sv);
+        bloom_set(h);
         size_t slot = h & VOCAB_MASK;
         while (vocab_table[slot].hash != 0) {
             if (vocab_table[slot].hash == h) return vocab_table[slot].token_id;
@@ -180,6 +273,7 @@ int main(int argc, char* argv[]) {
 
     auto find_token = [&](std::string_view sv) -> int64_t {
         uint64_t h = fnv1a_str(sv);
+        if (!bloom_test(h)) return -1;
         size_t slot = h & VOCAB_MASK;
         while (vocab_table[slot].hash != 0) {
             if (vocab_table[slot].hash == h) return vocab_table[slot].token_id;
@@ -291,6 +385,7 @@ int main(int argc, char* argv[]) {
                         p++;
                     }
                     if (h == 0) h = 1;
+                    if (!bloom_test(h)) continue;
 
                     size_t slot = h & VOCAB_MASK;
                     while (vocab_table[slot].hash != 0) {
@@ -368,6 +463,7 @@ int main(int argc, char* argv[]) {
                         p++;
                     }
                     if (h == 0) h = 1;
+                    if (!bloom_test(h)) continue;
 
                     size_t slot = h & VOCAB_MASK;
                     while (vocab_table[slot].hash != 0) {
@@ -692,7 +788,7 @@ int main(int argc, char* argv[]) {
     FILE* fp = fopen(results_path.c_str(), "wb");
     if (!fp) return 1;
 
-    ferocious::OutBuf out(fp);
+    OutBuf out(fp);
     for (unsigned tid = 0; tid < num_threads; ++tid) {
         out.puts(thread_outputs[tid].data(), thread_outputs[tid].size());
     }
